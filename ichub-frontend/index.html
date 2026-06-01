@@ -1,0 +1,134 @@
+<!--
+  Eclipse Tractus-X - Industry Core Hub Frontend
+
+  Copyright (c) 2026 LKS Next
+  Copyright (c) 2025 Contributors to the Eclipse Foundation
+
+  See the NOTICE file(s) distributed with this work for additional
+  information regarding copyright ownership.
+ 
+  This program and the accompanying materials are made available under the
+  terms of the Apache License, Version 2.0 which is available at
+  https://www.apache.org/licenses/LICENSE-2.0.
+ 
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+  either express or implied. See the
+  License for the specific language govern in permission and limitations
+  under the License.
+ 
+  SPDX-License-Identifier: Apache-2.0
+-->
+
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" href="/logo_tractus-x-min.ico" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@200..800&display=swap" rel="stylesheet">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Industry Core Hub - Eclipse Tractus-X</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script>
+      // Enhanced runtime configuration injection
+      // This will be replaced by Helm chart values during deployment
+      const ENV = {
+        // Core application
+        APP_ENVIRONMENT: "development",
+        APP_VERSION: "1.0.0",
+        
+        // API configuration
+        ICHUB_BACKEND_URL: "http://localhost:9000/v1",
+        API_TIMEOUT: "30000",
+        API_RETRY_ATTEMPTS: "3",
+        REQUIRE_HTTPS_URL_PATTERN: "false",
+        
+        // API key configuration
+        API_KEY: "",
+        API_KEY_HEADER: "X-API-Key",
+        ENABLE_API_KEY_ROTATION: "false",
+        API_KEY_EXPIRY_WARNING_DAYS: "7",
+        
+        // Authentication configuration
+        AUTH_ENABLED: "true",
+        AUTH_PROVIDER: "keycloak",
+        
+        // Keycloak configuration
+        KEYCLOAK_URL: "http://localhost:8080",
+        KEYCLOAK_REALM: "ICHub",
+        KEYCLOAK_CLIENT_ID: "industry-core-hub-frontend",
+        KEYCLOAK_ON_LOAD: "check-sso",
+        KEYCLOAK_CHECK_LOGIN_IFRAME: "false",
+        KEYCLOAK_SILENT_CHECK_SSO_REDIRECT_URI: "",
+        KEYCLOAK_PKCE_METHOD: "S256",
+        KEYCLOAK_ENABLE_LOGGING: "true",
+        KEYCLOAK_MIN_VALIDITY: "30",
+        KEYCLOAK_CHECK_LOGIN_IFRAME_INTERVAL: "5",
+        KEYCLOAK_FLOW: "standard",
+        
+        // Session management
+        AUTH_SESSION_TIMEOUT: "3600000",
+        AUTH_RENEW_TOKEN_MIN_VALIDITY: "300",
+        AUTH_LOGOUT_REDIRECT_URI: "",
+        
+        // Participant configuration
+        PARTICIPANT_ID: "",
+        BPN_VALIDATION_PATTERN: "",
+        
+        // Governance and policies - must be configured via GOVERNANCE_CONFIG, DTR_POLICIES_CONFIG and PCF_EXCHANGE_POLICIES_CONFIG env vars
+        // Format: JSON array string, e.g. '[{"semanticid":"...","policies":[...]}]'
+        // See Helm chart values or docker-compose for example values
+        GOVERNANCE_CONFIG: "[]",
+        DTR_POLICIES_CONFIG: "[]",
+        PCF_EXCHANGE_POLICIES_CONFIG: "[]",
+        GOVERNANCE_STRICT_MODE: "false",
+        
+        // Feature flags
+        ENABLE_ADVANCED_LOGGING: "true",
+        ENABLE_PERFORMANCE_MONITORING: "false",
+        ENABLE_DEV_TOOLS: "true",
+        
+        // Notifications
+        NOTIFICATIONS_POLL_INTERVAL: "30000",
+
+        // UI configuration
+        UI_THEME: "auto",
+        UI_LOCALE: "en",
+        UI_COMPACT_MODE: "false"
+      }
+      
+      // Validate and sanitize environment
+      Object.keys(ENV).forEach(key => {
+        if (ENV[key] === 'undefined' || ENV[key] === '') {
+          delete ENV[key];
+        }
+      });
+      
+      window.ENV = ENV;
+      
+      // Conditional debug output controlled by `ENABLE_DEV_TOOLS`
+      if (ENV.ENABLE_DEV_TOOLS === 'true') {
+        try {
+          console.log('🔧 CONFIG LOADED:', {
+            AUTH_ENABLED: ENV.AUTH_ENABLED,
+            AUTH_PROVIDER: ENV.AUTH_PROVIDER,
+            timestamp: new Date().toISOString()
+          });
+        } catch (e) {}
+      }
+      // Conditional performance monitoring (development only)
+      if (ENV.ENABLE_PERFORMANCE_MONITORING === 'true' && ENV.ENABLE_DEV_TOOLS === 'true') {
+        window.addEventListener('load', () => {
+          try { console.info('App loaded in:', performance.now(), 'ms'); } catch(e) {}
+        });
+      }
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

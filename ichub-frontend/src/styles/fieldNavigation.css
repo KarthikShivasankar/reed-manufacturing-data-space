@@ -1,0 +1,164 @@
+/********************************************************************************
+ * Eclipse Tractus-X - Industry Core Hub Frontend
+ *
+ * Copyright (c) 2025 Contributors to the Eclipse Foundation
+ *
+ * See the NOTICE file(s) distributed with this work for additional
+ * information regarding copyright ownership.
+ *
+ * This program and the accompanying materials are made available under the
+ * terms of the Apache License, Version 2.0 which is available at
+ * https://www.apache.org/licenses/LICENSE-2.0.
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+ * either express or implied. See the
+ * License for the specific language govern in permissions and limitations
+ * under the License.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ ********************************************************************************/
+
+
+/* Highlight for primitive fields - SAME pulsing style as containers */
+.field-nav-highlight {
+  background-color: rgba(96, 165, 250, 0.08) !important;
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.5), inset 0 0 20px rgba(96, 165, 250, 0.08) !important;
+  border-radius: 8px;
+  position: relative !important;
+  overflow: visible !important;
+}
+
+/* Pulsing border for primitive fields */
+.field-nav-highlight::after {
+  content: '';
+  position: absolute;
+  top: -4px;
+  left: -4px;
+  right: -4px;
+  bottom: -4px;
+  border-radius: 12px;
+  border: 2px solid rgba(96, 165, 250, 0.7);
+  animation: container-pulse 1s ease-in-out 3;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Highlight for array item cards */
+.field-nav-highlight-container {
+  background-color: rgba(96, 165, 250, 0.08) !important;
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.5), inset 0 0 20px rgba(96, 165, 250, 0.08) !important;
+  border-radius: 8px;
+  position: relative !important;
+  overflow: visible !important;
+}
+
+/* Pulsing effect for item cards */
+.field-nav-highlight-container::after {
+  content: '';
+  position: absolute;
+  top: -4px;
+  left: -4px;
+  right: -4px;
+  bottom: -4px;
+  border-radius: 12px;
+  border: 2px solid rgba(96, 165, 250, 0.7);
+  animation: container-pulse 1s ease-in-out 3;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Highlight for array headers (title, info icon, badges, add button + bottom border) */
+.field-nav-highlight-array-header {
+  background-color: rgba(255, 255, 255, 0.08) !important;
+  border-radius: 8px !important;
+  position: relative !important;
+  /* Enhanced bottom border to make it stand out */
+  border-bottom-color: rgba(96, 165, 250, 0.8) !important;
+  border-bottom-width: 3px !important;
+}
+
+/* Glow effect for array header */
+.field-nav-highlight-array-header::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  border-radius: 8px;
+  box-shadow: 0 0 15px rgba(96, 165, 250, 0.3), inset 0 0 10px rgba(255, 255, 255, 0.05);
+  pointer-events: none;
+  animation: header-glow 1.5s ease-in-out 2;
+}
+
+@keyframes header-glow {
+  0%, 100% {
+    box-shadow: 0 0 10px rgba(96, 165, 250, 0.2), inset 0 0 8px rgba(255, 255, 255, 0.03);
+  }
+  50% {
+    box-shadow: 0 0 25px rgba(96, 165, 250, 0.5), inset 0 0 15px rgba(255, 255, 255, 0.08);
+  }
+}
+
+/* Highlight for nested objects - EXACT COPY of container style */
+.field-nav-highlight-nested-object {
+  background-color: rgba(96, 165, 250, 0.08) !important;
+  box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.5), inset 0 0 20px rgba(96, 165, 250, 0.08) !important;
+  border-radius: 8px;
+  position: relative !important;
+  overflow: visible !important;
+}
+
+/* Pulsing border for nested objects - EXACT COPY of container ::after */
+.field-nav-highlight-nested-object::after {
+  content: '';
+  position: absolute;
+  top: -4px;
+  left: -4px;
+  right: -4px;
+  bottom: -4px;
+  border-radius: 12px;
+  border: 2px solid rgba(96, 165, 250, 0.7);
+  animation: container-pulse 1s ease-in-out 3;
+  pointer-events: none;
+  z-index: 1;
+}
+
+@keyframes container-pulse {
+  0%, 100% {
+    opacity: 0.3;
+    border-color: rgba(96, 165, 250, 0.4);
+  }
+  50% {
+    opacity: 1;
+    border-color: rgba(96, 165, 250, 0.9);
+  }
+}
+
+/* Animatable wrapper controls the transitions so they apply both when class is added and removed */
+.field-nav-animatable {
+  transition: background-color 600ms cubic-bezier(.22,.9,.26,1), box-shadow 600ms cubic-bezier(.22,.9,.26,1), border-color 600ms cubic-bezier(.22,.9,.26,1);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .field-nav-animatable {
+    transition: none;
+  }
+}
+
+/* Hover-like outline when navigated to */
+.field-nav-hover {
+  /* This targets the outline color used on hover in the form controls */
+  /* The actual visible outline is usually the fieldset/notchedOutline; set a border-color-ish effect via box-shadow to match */
+  box-shadow: inset 0 2px 10px rgba(255,255,255,0.10), 0 0 0 3px rgba(96,165,250,0.28);
+}
+
+/* Ensure boolean controls (Switch/Checkbox and label wrappers) show the hover outline when navigated to */
+.MuiSwitch-root.field-nav-hover,
+.MuiCheckbox-root.field-nav-hover,
+.MuiFormControlLabel-root.field-nav-hover {
+  box-shadow: inset 0 2px 10px rgba(255,255,255,0.10), 0 0 0 3px rgba(96,165,250,0.28);
+  border-radius: 6px;
+}

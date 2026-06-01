@@ -1,0 +1,81 @@
+{{- /*
+* Eclipse Tractus-X - Industry Core Hub
+*
+* Copyright (c) 2025 LKS Next
+* Copyright (c) 2025 Contributors to the Eclipse Foundation
+*
+* See the NOTICE file(s) distributed with this work for additional
+* information regarding copyright ownership.
+*
+* This program and the accompanying materials are made available under the
+* terms of the Apache License, Version 2.0 which is available at
+* https://www.apache.org/licenses/LICENSE-2.0.
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+* WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+* License for the specific language governing permissions and limitations
+* under the License.
+*
+* SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if and .Values.keycloak.enabled .Values.keycloak.realmImport.enabled }}
+{{- $realmData := .Files.Get "files/realm-export.json" | fromJson }}
+
+{{- /* Update client redirect URIs and web origins */ -}}
+{{- if .Values.keycloak.ichubRealm.clients }}
+{{- range $client := $realmData.clients }}
+  {{- if eq $client.clientId "industry-core-hub-frontend" }}
+    {{- if $.Values.keycloak.ichubRealm.clients.frontend }}
+      {{- $_ := set $client "redirectUris" $.Values.keycloak.ichubRealm.clients.frontend.redirectUris }}
+      {{- $_ := set $client "webOrigins" $.Values.keycloak.ichubRealm.clients.frontend.webOrigins }}
+      {{- $postLogoutUris := join "##" (concat $.Values.keycloak.ichubRealm.clients.frontend.redirectUris) }}
+      {{- $_ := set $client.attributes "post.logout.redirect.uris" $postLogoutUris }}
+    {{- end }}
+  {{- else if eq $client.clientId "industry-core-hub-api" }}
+    {{- if $.Values.keycloak.ichubRealm.clients.backend }}
+      {{- $_ := set $client "redirectUris" $.Values.keycloak.ichubRealm.clients.backend.redirectUris }}
+      {{- $_ := set $client "webOrigins" $.Values.keycloak.ichubRealm.clients.backend.webOrigins }}
+    {{- end }}
+  {{- end }}
+{{- end }}
+{{- end }}
+
+{{- /* Update realm users */ -}}
+{{- $_ := set $realmData "users" list }}
+{{- range $user := .Values.keycloak.ichubRealm.users }}
+{{- $passwordVar := printf "$(%s_PASSWORD)" ($user.username | upper | replace "-" "_") }}
+{{- $credentials := list (dict "type" "password" "value" $passwordVar "temporary" false) }}
+{{- $newUser := dict 
+  "username" $user.username
+  "enabled" (default true $user.enabled)
+  "totp" false
+  "emailVerified" (default true $user.emailVerified)
+  "firstName" (default "" $user.firstName)
+  "lastName" (default "" $user.lastName)
+  "email" $user.email
+  "attributes" (default dict $user.attributes)
+  "credentials" $credentials
+  "disableableCredentialTypes" list
+  "requiredActions" list
+  "realmRoles" (default (list "default-roles-ichub") $user.realmRoles)
+  "clientRoles" (default dict $user.clientRoles)
+  "notBefore" 0
+  "groups" (default list $user.groups)
+}}
+{{- $_ := set $realmData "users" (append $realmData.users $newUser) }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-realm-data
+  namespace: {{ .Release.Namespace | default "default" | quote }}
+  labels:
+    {{- include "industry-core-hub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak
+  annotations:
+    "argocd.argoproj.io/sync-wave": "1"
+data:
+  realm-export.json: |
+{{ $realmData | toPrettyJson | indent 4 }}
+{{- end }}

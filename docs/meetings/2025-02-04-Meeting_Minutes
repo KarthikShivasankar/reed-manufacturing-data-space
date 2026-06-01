@@ -1,0 +1,43 @@
+# Meeting 04.02.2025 - Development Kickstart
+
+
+## Onboarding and Working Model
+
+-> Weekly -> Tuesday from 9 - 10
+
+Proposal:
+
+- Backend -> Tuesday 10:30 - 11:00
+- Architecture -> Thursday 13 - 14
+- Frontend -> 14:00 - 14:30
+
+Full-Stack goes both backend and frontend.
+
+Webpage weeklys open source Tractus-X -> @matbmoser will create it.
+
+## Introduction to Industry Core and Catena-X was done
+
+Introduction to Catena-X & Industry Core
+
+## Repository is available
+
+Template for pull request. (why and what)
+
+The application is an "orchestrator" from EDC, Digital Twin Registry, and Data Services.
+
+## Homework
+
+- **Sonam** will create in the folder `/ichub-frontend` a template for the frontend based on:  
+  - [Eclipse Tractus-X Portal Shared Components](https://github.com/eclipse-tractusx/portal-shared-components)
+- Fork repo: https://github.com/eclipse-tractusx/industry-core-hub
+   - To check if you are able to contribute add your name in [AUTHORS.md](../../AUTHORS.md)! - I will check the PR 
+- Read the TRGs: https://eclipse-tractusx.github.io/docs/release
+  - Use License Header!!!  
+- Use Conventional Commits: https://www.conventionalcommits.org/en/v1.0.0/
+- Take Care with IP issues, we need to review everything with Eclipse Dash License https://github.com/eclipse-dash/dash-licenses
+- PRs with less than 1.000 will not be merged
+  
+- @matbmoser tasks:
+  - will add template to repository for PR schema.
+  - deploy EDC, Digital Twin Registry, and Data Service in INT environment from the association.
+  - will provide the walk through postman so we can start to think how to do the apis.

@@ -1,0 +1,223 @@
+{{- /*
+* Eclipse Tractus-X - Industry Core Hub
+*
+* Copyright (c) 2025 Contributors to the Eclipse Foundation
+*
+* See the NOTICE file(s) distributed with this work for additional
+* information regarding copyright ownership.
+*
+* This program and the accompanying materials are made available under the
+* terms of the Apache License, Version 2.0 which is available at
+* https://www.apache.org/licenses/LICENSE-2.0.
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+* WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+* License for the specific language governing permissions and limitations
+* under the License.
+*
+* SPDX-License-Identifier: Apache-2.0
+*/}}
+
+{{ if .Values.frontend.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "industry-core-hub.fullname.frontend" . }}
+  labels:
+    {{- include "industry-core-hub.frontend.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "industry-core-hub.frontend.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.frontend.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "industry-core-hub.frontend.labels" . | nindent 8 }}
+        {{- with .Values.frontend.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.frontend.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.frontend.podSecurityContext | nindent 8 }}
+      automountServiceAccountToken: false
+      containers:
+        - name: {{ include "industry-core-hub.fullname.frontend" . }}
+          securityContext:
+            {{- toYaml .Values.frontend.securityContext | nindent 12 }}
+          image: "{{ .Values.frontend.image.repository }}:{{ .Values.frontend.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.frontend.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.frontend.service.portContainer }}
+              protocol: TCP
+          env:
+            # Core application
+            - name: APP_ENVIRONMENT
+              value: "{{ .Values.frontend.config.environment }}"
+            - name: APP_VERSION
+              value: "{{ .Values.frontend.config.version }}"
+            
+            # Keycloak configuration
+            - name: KEYCLOAK_URL
+              value: "{{ .Values.frontend.config.keycloak.url }}"
+            - name: KEYCLOAK_REALM
+              value: "{{ .Values.frontend.config.keycloak.realm }}"
+            - name: KEYCLOAK_CLIENT_ID
+              value: "{{ .Values.frontend.config.keycloak.clientId }}"
+            - name: KEYCLOAK_ON_LOAD
+              value: "{{ .Values.frontend.config.keycloak.onLoad }}"
+            - name: KEYCLOAK_CHECK_LOGIN_IFRAME
+              value: "{{ .Values.frontend.config.keycloak.checkLoginIframe }}"
+            - name: KEYCLOAK_SILENT_CHECK_SSO_REDIRECT_URI
+              value: "{{ .Values.frontend.config.keycloak.silentCheckSsoRedirectUri }}"
+            - name: KEYCLOAK_PKCE_METHOD
+              value: "{{ .Values.frontend.config.keycloak.pkceMethod }}"
+            - name: KEYCLOAK_ENABLE_LOGGING
+              value: "{{ .Values.frontend.config.keycloak.enableLogging }}"
+            - name: KEYCLOAK_MIN_VALIDITY
+              value: "{{ .Values.frontend.config.keycloak.minValidity }}"
+            - name: KEYCLOAK_CHECK_LOGIN_IFRAME_INTERVAL
+              value: "{{ .Values.frontend.config.keycloak.checkLoginIframeInterval }}"
+            - name: KEYCLOAK_FLOW
+              value: "{{ .Values.frontend.config.keycloak.flow }}"
+            
+            # API configuration
+            - name: ICHUB_BACKEND_URL
+              value: "{{ .Values.frontend.config.ichubBackendUrl }}"
+            - name: API_TIMEOUT
+              value: "{{ .Values.frontend.config.apiTimeout }}"
+            - name: API_RETRY_ATTEMPTS
+              value: "{{ .Values.frontend.config.apiRetryAttempts }}"
+            - name: REQUIRE_HTTPS_URL_PATTERN
+              value: "{{ .Values.frontend.config.requireHttpsUrlPattern }}"
+            
+            # API key configuration
+            {{- if .Values.frontend.config.apiKey }}
+            - name: API_KEY
+              value: "{{ .Values.frontend.config.apiKey }}"
+            {{- end }}
+            - name: API_KEY_HEADER
+              value: "{{ .Values.frontend.config.apiKeyHeader }}"
+            - name: ENABLE_API_KEY_ROTATION
+              value: "{{ .Values.frontend.config.enableApiKeyRotation }}"
+            - name: API_KEY_EXPIRY_WARNING_DAYS
+              value: "{{ .Values.frontend.config.apiKeyExpiryWarningDays }}"
+            
+            # Authentication configuration
+            - name: AUTH_ENABLED
+              value: "{{ .Values.frontend.config.authEnabled }}"
+            - name: AUTH_PROVIDER
+              value: "{{ .Values.frontend.config.authProvider }}"
+            
+            # Session management
+            - name: AUTH_SESSION_TIMEOUT
+              value: "{{ .Values.frontend.config.authSessionTimeout }}"
+            - name: AUTH_RENEW_TOKEN_MIN_VALIDITY
+              value: "{{ .Values.frontend.config.authRenewTokenMinValidity }}"
+            - name: AUTH_LOGOUT_REDIRECT_URI
+              value: "{{ .Values.frontend.config.authLogoutRedirectUri }}"
+            
+            # Participant configuration
+            - name: PARTICIPANT_ID
+              value: "{{ .Values.participantId }}"
+            
+            # Governance and policies configuration
+            - name: GOVERNANCE_CONFIG
+              value: {{ .Values.frontend.consumption.governance | toJson | quote }}
+            - name: DTR_POLICIES_CONFIG
+              value: {{ .Values.frontend.consumption.digitalTwinRegistry.policies | toJson | quote }}
+            - name: PCF_EXCHANGE_POLICIES_CONFIG
+              value: {{ .Values.frontend.consumption.pcfExchange.policies | toJson | quote }}
+
+            # Feature flags
+            - name: ENABLE_ADVANCED_LOGGING
+              value: "{{ .Values.frontend.config.enableAdvancedLogging }}"
+            - name: ENABLE_PERFORMANCE_MONITORING
+              value: "{{ .Values.frontend.config.enablePerformanceMonitoring }}"
+            - name: ENABLE_DEV_TOOLS
+              value: "{{ .Values.frontend.config.enableDevTools }}"
+            
+            # Notifications configuration
+            - name: NOTIFICATIONS_POLL_INTERVAL
+              value: "{{ .Values.frontend.config.notifications.pollInterval }}"
+
+            # UI configuration
+            - name: UI_THEME
+              value: "{{ .Values.frontend.config.uiTheme }}"
+            - name: UI_LOCALE
+              value: "{{ .Values.frontend.config.uiLocale }}"
+            - name: UI_COMPACT_MODE
+              value: "{{ .Values.frontend.config.uiCompactMode }}"
+          {{- if .Values.frontend.healthChecks.startup.enabled }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.frontend.healthChecks.startup.path }}
+              port: {{ .Values.frontend.service.portContainer }}
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.startupProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.startupProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.startupProbe.timeoutSeconds }}
+            successThreshold: {{ .Values.startupProbe.successThreshold }}
+            failureThreshold: {{ .Values.startupProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.frontend.healthChecks.liveness.enabled }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.frontend.healthChecks.liveness.path }}
+              port: {{ .Values.frontend.service.portContainer }}
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.livenessProbe.timeoutSeconds }}
+            successThreshold: {{ .Values.livenessProbe.successThreshold }}
+            failureThreshold: {{ .Values.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.frontend.healthChecks.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.frontend.healthChecks.readiness.path }}
+              port: {{ .Values.frontend.service.portContainer }}
+              scheme: HTTP
+            initialDelaySeconds: {{ .Values.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.readinessProbe.timeoutSeconds }}
+            successThreshold: {{ .Values.readinessProbe.successThreshold }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+          {{- end }}
+          {{- with .Values.frontend.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- toYaml .Values.frontend.volumeMounts | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.frontend.additionalVolumes }}
+        {{- toYaml .Values.frontend.additionalVolumes | nindent 8 }}
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

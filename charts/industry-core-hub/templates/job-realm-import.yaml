@@ -1,0 +1,132 @@
+{{- /*
+* Eclipse Tractus-X - Industry Core Hub
+*
+* Copyright (c) 2025 LKS Next
+* Copyright (c) 2025 Contributors to the Eclipse Foundation
+*
+* See the NOTICE file(s) distributed with this work for additional
+* information regarding copyright ownership.
+*
+* This program and the accompanying materials are made available under the
+* terms of the Apache License, Version 2.0 which is available at
+* https://www.apache.org/licenses/LICENSE-2.0.
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+* WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+* License for the specific language governing permissions and limitations
+* under the License.
+*
+* SPDX-License-Identifier: Apache-2.0
+*/}}
+{{- if and .Values.keycloak.enabled .Values.keycloak.realmImport.enabled (eq .Values.keycloak.realmImport.method "job") }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-realm-import
+  namespace: {{ .Release.Namespace | default "default" | quote }}
+  labels:
+    {{- include "industry-core-hub.labels" . | nindent 4 }}
+    app.kubernetes.io/component: keycloak-import
+  annotations:
+    {{- if eq .Values.deploymentMode "argocd"  }}
+    # ArgoCD annotations - runs after every sync completes
+    "argocd.argoproj.io/hook": PostSync
+    "argocd.argoproj.io/hook-delete-policy": BeforeHookCreation
+    {{- else }}
+    # Helm hooks for standard Helm deployments
+    "helm.sh/hook": post-install, post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+    {{- end }}
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "industry-core-hub.labels" . | nindent 8 }}
+        app.kubernetes.io/component: keycloak-import
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-keycloak
+          image: curlimages/curl:8.5.0
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -e
+              echo "Waiting for Keycloak at http://{{ .Release.Name }}-keycloak:{{ .Values.keycloak.service.httpPort | default 80 }}{{ .Values.keycloak.keycloak.httpRelativePath | default "" | trimSuffix "/" }}/realms/master..."
+              for i in $(seq 1 60); do
+                if curl -f "http://{{ .Release.Name }}-keycloak:{{ .Values.keycloak.service.httpPort | default 80 }}{{ .Values.keycloak.keycloak.httpRelativePath | default "" | trimSuffix "/" }}/realms/master" >/dev/null 2>&1; then
+                  echo "✓ Keycloak is ready!"
+                  exit 0
+                fi
+                echo "Attempt $i/60: Waiting for Keycloak..."
+                sleep 10
+              done
+              echo "ERROR: Keycloak not available after 10 minutes"
+              exit 1
+      containers:
+        - name: keycloak-config-cli
+          image: {{ .Values.keycloak.realmImport.image.repository }}:{{ .Values.keycloak.realmImport.image.tag }}
+          imagePullPolicy: {{ .Values.keycloak.realmImport.image.pullPolicy }}
+          env:
+            - name: KEYCLOAK_URL
+              value: "http://{{ .Release.Name }}-keycloak:{{ .Values.keycloak.service.httpPort | default 80 }}{{ .Values.keycloak.keycloak.httpRelativePath | default "/" | trimSuffix "/" }}"
+            - name: KEYCLOAK_USER
+              value: "{{ .Values.keycloak.keycloak.adminUser }}"
+            - name: KEYCLOAK_PASSWORD
+              value: "{{ .Values.keycloak.keycloak.adminPassword }}"
+            - name: KEYCLOAK_AVAILABILITYCHECK_ENABLED
+              value: "true"
+            - name: KEYCLOAK_AVAILABILITYCHECK_TIMEOUT
+              value: "120s"
+            - name: IMPORT_PATH
+              value: "/config"
+            - name: IMPORT_FORCE
+              value: "true"
+            - name: IMPORT_VAR_SUBSTITUTION_ENABLED
+              value: "true"
+            {{- range $user := .Values.keycloak.ichubRealm.users }}
+            - name: {{ $user.username | upper | replace "-" "_" }}_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $.Release.Name }}-keycloak-realm-users
+                  key: {{ $user.username }}-password
+            {{- end }}
+          volumeMounts:
+            - name: realm-config
+              mountPath: /config
+              readOnly: true
+          resources:
+            {{- toYaml .Values.keycloak.realmImport.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+      volumes:
+        - name: realm-config
+          configMap:
+            name: {{ .Release.Name }}-realm-data
+      securityContext:
+        fsGroup: 1000
+        runAsNonRoot: true
+{{- end }}

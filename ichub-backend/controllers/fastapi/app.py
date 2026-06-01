@@ -1,0 +1,394 @@
+#################################################################################
+# Eclipse Tractus-X - Industry Core Hub Backend
+#
+# Copyright (c) 2025 DRÄXLMAIER Group
+# (represented by Lisa Dräxlmaier GmbH)
+# Copyright (c) 2025 Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License, Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied. See the
+# License for the specific language govern in permissions and limitations
+# under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+#################################################################################
+
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, APIRouter
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.utils import get_openapi
+import os
+import logging
+
+from tools.exceptions import BaseError, ValidationError
+from tools.constants import API_V1
+from managers.config.config_manager import ConfigManager
+
+startup_logger = logging.getLogger("app.startup")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Run startup tasks before serving requests."""
+    _ensure_reed_tables_on_startup()
+    _sync_digital_twin_event_asset_on_startup()
+    yield
+
+
+def _ensure_reed_tables_on_startup() -> None:
+    """
+    Ensure the additive REED Manufacturing Data Space tables exist.
+
+    REED tables are created via SQLModel (only missing tables are created) so the
+    feature works without editing the externally managed metadata DDL. Failures
+    are logged but do not prevent the backend from starting.
+    """
+    try:
+        from models.metadata_database.reed.tables import create_reed_tables
+        create_reed_tables()
+    except Exception as e:
+        startup_logger.error(f"[Startup] Failed to ensure REED tables: {e}", exc_info=True)
+
+
+def _sync_digital_twin_event_asset_on_startup() -> None:
+    """
+    Register the Digital Twin Event asset in the EDC on every backend startup.
+    This ensures the notification endpoint is always advertised in the connector
+    catalog, even if the Kubernetes sync Job has not run yet.
+    Failures are logged but do not prevent the backend from starting.
+    """
+    try:
+        # Import here to avoid circular imports at module load time.
+        from connector import connector_provider_manager, connector_start_up_error
+
+        if connector_start_up_error or connector_provider_manager is None:
+            startup_logger.warning(
+                "[Startup] Connector is not available. Skipping Digital Twin Event asset sync."
+            )
+            return
+
+        dte_config = ConfigManager.get_config("provider.digitalTwinEventAPI")
+        if not dte_config:
+            startup_logger.warning(
+                "[Startup] No 'provider.digitalTwinEventAPI' config found. "
+                "Skipping Digital Twin Event asset sync."
+            )
+            return
+
+        asset_config = dte_config.get("asset_config", {})
+        dte_asset_id, _, _, _ = connector_provider_manager.register_digital_twin_event_offer(
+            digital_twin_event_url=dte_config.get("hostname"),
+            digital_twin_event_policy_config=dte_config.get("policy"),
+            existing_asset_id=asset_config.get("existing_asset_id"),
+        )
+        startup_logger.info(
+            f"[Startup] Digital Twin Event asset synced successfully: {dte_asset_id}"
+        )
+    except Exception as e:
+        startup_logger.error(
+            f"[Startup] Failed to sync Digital Twin Event asset: {e}", exc_info=True
+        )
+
+from tractusx_sdk.dataspace.tools import op
+
+from .routers.provider.v1 import (
+    part_management,
+    partner_management,
+    twin_management,
+    submodel_dispatcher,
+    sharing_handler
+)
+from .routers.consumer.v1 import (
+    connection_management,
+    discovery_management
+)
+from .routers.notifications.v1 import (
+    digital_twin_event_api,
+    notifications_management
+)
+from .routers.addons import addons
+from .routers.reed.v1 import (
+    classification as reed_classification,
+    policy_template as reed_policy_template,
+    supply_chain as reed_supply_chain,
+    authorization as reed_authorization,
+    access_request as reed_access_request,
+    audit as reed_audit,
+    admin as reed_admin,
+)
+
+tags_metadata = [
+    {
+        "name": "Part Management",
+        "description": "Management of part metadata - including catalog parts, serialized parts, JIS parts and batches"
+    },
+    {
+        "name": "Sharing Functionality",
+        "description": "Sharing functionality for catalog part twins - including sharing of parts with business partners and automatic generation of digital twins and submodels"
+    },
+    {
+        "name": "Partner Management",
+        "description": "Management of master data around business partners - including business partners, data exchange agreements and contracts"
+    },
+    {
+        "name": "Twin Management",
+        "description": "Management of how product information can be managed and shared"
+    },
+    {
+        "name": "Submodel Dispatcher",
+        "description": "Internal API called by EDC Data Planes or Admins in order the deliver data of of the internal used Submodel Service"
+    },
+    {
+        "name": "Open Connection Management",
+        "description": "Handles the connections from the consumer modules, for specific services like digital twin registry and data endpoints"
+    },
+    {
+        "name": "Part Discovery Management",
+        "description": "Management of the discovery of parts, searching for digital twins and digital twins registries"
+    },
+    {
+        "name": "Digital Twin Event Management",
+        "description": "Endpoints for receiving notifications about events related to digital twins, such as updates or changes in the twin data"
+    },
+    {
+        "name": "Notifications Management",
+        "description": "Endpoints for managing notifications, such as retrieving, deleting or marking notifications related to digital twins and part sharing"
+    },
+    {
+        "name": "Add-Ons Microservices",
+        "description": "Auxiliary add-ons such as Eco Pass Kit"
+    },
+    {
+        "name": "EcoPass KIT Microservices",
+        "description": "Provider-side EcoPass KIT endpoints"
+    },
+    {
+        "name": "PCF KIT Microservices",
+        "description": "Provider-side PCF KIT endpoints"
+    },
+    {
+        "name": "REED Data Classification",
+        "description": "REED Manufacturing Data Space - DMP-derived data classification matrix mapping asset classes to sensitivity, discoverability and default policy templates"
+    },
+    {
+        "name": "REED Policy Templates",
+        "description": "REED catalogue/contract/usage policy templates and their rendering into EDC/ODRL policy definitions"
+    },
+    {
+        "name": "REED Supply Chain",
+        "description": "REED supply-chain relationship graph between business partners (BPNs)"
+    },
+    {
+        "name": "REED Authorization",
+        "description": "REED context-based authorization engine combining token claims, asset context and supply-chain relationships before EDC/DTR access"
+    },
+    {
+        "name": "REED Access Requests",
+        "description": "REED consumer access-request workflow: submit, review, decide, contract and transfer"
+    },
+    {
+        "name": "REED Audit",
+        "description": "REED audit trail linking participant, user, BPN, asset, purpose, contract agreement and outcome"
+    },
+    {
+        "name": "REED Administration",
+        "description": "REED administrative operations such as seeding the default policy catalogue and classification matrix"
+    }
+]
+
+app = FastAPI(title="Industry Core Hub Backend API", version="0.0.1", openapi_tags=tags_metadata, lifespan=lifespan)
+
+# Configure CORS middleware based on environment and configuration
+def get_cors_origins():
+    """Get CORS origins from environment variables and configuration."""
+    # Start with default localhost origins for development
+    default_origins = [
+        "http://localhost:5173",  # Vite dev server
+        "http://localhost:3000",  # React dev server
+        "http://localhost:8080",  # Alternative frontend port
+        "http://127.0.0.1:5173",  # Alternative localhost notation
+        "http://127.0.0.1:3000",
+        "http://127.0.0.1:8080",
+    ]
+    
+    # Add origins from environment variables (for container deployments)
+    env_origins = []
+    
+    # Check for CORS_ORIGINS environment variable (comma-separated)
+    cors_origins_env = os.getenv("CORS_ORIGINS")
+    if cors_origins_env:
+        env_origins.extend([origin.strip() for origin in cors_origins_env.split(",")])
+    
+    # Check for individual frontend URL environment variable
+    frontend_url = os.getenv("FRONTEND_URL")
+    if frontend_url:
+        env_origins.append(frontend_url)
+    
+    # Try to get origins from configuration file
+    try:
+        config = ConfigManager.get_config()
+        if config and "cors" in config and "allow_origins" in config["cors"]:
+            config_origins = config["cors"]["allow_origins"]
+            if isinstance(config_origins, list):
+                env_origins.extend(config_origins)
+    except Exception:
+        # If config loading fails, continue with defaults
+        pass
+    
+    # Combine all origins and remove duplicates
+    all_origins = list(set(default_origins + env_origins))
+    
+    # In production, you might want to be more restrictive
+    if os.getenv("ENVIRONMENT") == "production":
+        # Filter out localhost origins in production
+        all_origins = [origin for origin in all_origins if not ("localhost" in origin or "127.0.0.1" in origin)]
+    
+    return all_origins
+
+# Check if CORS is enabled (default to True for development)
+cors_enabled = os.getenv("CORS_ENABLED", "true").lower() == "true"
+
+if cors_enabled:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=get_cors_origins(),
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+        allow_headers=["*"],
+    )
+
+## Include here all the routers for the application.
+# API Version 1
+v1_router = APIRouter(prefix=f"/{API_V1}")
+v1_router.include_router(part_management.router)
+v1_router.include_router(partner_management.router)
+v1_router.include_router(twin_management.router)
+v1_router.include_router(submodel_dispatcher.router)
+v1_router.include_router(sharing_handler.router)
+v1_router.include_router(connection_management.router)
+v1_router.include_router(discovery_management.router)
+v1_router.include_router(digital_twin_event_api.router)
+v1_router.include_router(notifications_management.router)
+v1_router.include_router(addons.router)
+# REED Manufacturing Data Space routers
+v1_router.include_router(reed_classification.router)
+v1_router.include_router(reed_policy_template.router)
+v1_router.include_router(reed_supply_chain.router)
+v1_router.include_router(reed_authorization.router)
+v1_router.include_router(reed_access_request.router)
+v1_router.include_router(reed_audit.router)
+v1_router.include_router(reed_admin.router)
+
+# Include the API version 1 router into the main app
+app.include_router(v1_router)
+
+
+def custom_openapi():
+    """
+    Add custom tag grouping so add-ons appear nested under the Add-Ons section.
+    """
+    if app.openapi_schema:
+        return app.openapi_schema
+
+    openapi_schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=tags_metadata,
+    )
+
+    openapi_schema["x-tagGroups"] = [
+        {
+            "name": "Core Services",
+            "tags": [
+                "Part Management",
+                "Sharing Functionality",
+                "Partner Management",
+                "Twin Management",
+                "Submodel Dispatcher",
+                "Open Connection Management",
+                "Part Discovery Management",
+                "Digital Twin Event Management",
+                "Notifications Management"
+            ],
+        },
+        {
+            "name": "Add-Ons",
+            "tags": [
+                "Add-Ons Microservices",
+                "EcoPass KIT Microservices",
+                "EcoPass KIT Consumer Microservices",
+                "PCF KIT Microservices"
+            ],
+        },
+        {
+            "name": "REED Manufacturing Data Space",
+            "tags": [
+                "REED Data Classification",
+                "REED Policy Templates",
+                "REED Supply Chain",
+                "REED Authorization",
+                "REED Access Requests",
+                "REED Audit",
+                "REED Administration"
+            ],
+        },
+    ]
+
+    app.openapi_schema = openapi_schema
+    return app.openapi_schema
+
+
+app.openapi = custom_openapi
+
+@app.exception_handler(BaseError)
+async def base_error_exception_handler(
+    request: Request,
+    exc: BaseError) -> JSONResponse:
+    """
+    Generic exception handler for all exceptions derived from BaseError.
+    """
+    return JSONResponse(status_code=exc.status_code, content=exc.detail.model_dump())
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    """
+    Exception handler for validation errors.
+    Returns the first error message plus a list of all field-level errors so callers
+    can see exactly which fields failed and why.
+    """
+    errors = exc.errors()
+    message = errors[0]["msg"] if errors else "Validation error"
+    details = [
+        f"{' -> '.join(str(loc) for loc in e['loc'])}: {e['msg']}"
+        for e in errors
+    ]
+    return JSONResponse(
+        status_code=422,
+        content={"status": 422, "message": message, "details": details}
+    )
+
+@app.get("/health")
+def check_health():
+    """
+    Retrieves health information from the server
+
+    Returns:
+        response: :obj:`status, timestamp`
+    """
+    return {
+        "status": "RUNNING",
+        "timestamp": op.timestamp() 
+    }

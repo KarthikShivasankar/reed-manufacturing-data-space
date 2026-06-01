@@ -1,0 +1,196 @@
+#################################################################################
+# Eclipse Tractus-X - Industry Core Hub Backend
+#
+# Copyright (c) 2026 LKS Next
+# Copyright (c) 2025 Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License, Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied. See the
+# License for the specific language govern in permissions and limitations
+# under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+#################################################################################
+
+from pydantic import BaseModel
+from typing import Optional
+
+class ErrorDetail(BaseModel):
+    status: int
+    message: str
+    details: Optional[list[str]] = None
+    """Optional structured details (e.g. per-policy diff lines) for human-readable diagnostics."""
+
+exception_responses ={
+        400: {
+            "description": "Invalid input provided. Please check your request and try again.",
+            "model": ErrorDetail
+        },
+        403: {
+            "description": "Access denied. You do not have permission to perform this action.",
+            "model": ErrorDetail
+        },
+        404: {
+            "description": "Catalog not found",
+            "model": ErrorDetail
+        },
+        409: {
+            "description": "Catalog part already exists",
+            "model": ErrorDetail
+        },
+        422: {
+            "description": "Validation Error",
+            "model": ErrorDetail
+        },
+        502: {
+            "description": "Bad Gateway - The server received an invalid response from the upstream server.",
+            "model": ErrorDetail
+        },
+        503: {
+            "description": "Service unavailable. Please try again later.",
+            "model": ErrorDetail
+        }
+    }
+
+class BaseError(Exception):
+    def __init__(self, status_code: int, message: str, details: Optional[list[str]] = None):
+        self.status_code = status_code
+        self.detail = ErrorDetail(status=status_code, message=message, details=details)
+        super().__init__(message)
+
+class InvalidError(BaseError):
+    """
+    Exception raised when an invalid value is provided.
+    """
+    def __init__(self, message: str):
+        super().__init__(status_code=400, message=message)
+
+class NotFoundError(BaseError):
+    """
+    Exception raised when a requested resource is not found.
+    """
+    def __init__(self, message: str):
+        super().__init__(status_code=404, message=message)
+
+class AlreadyExistsError(BaseError):
+    """
+    Exception raised when a resource already exists.
+    """
+    def __init__(self, message: str):
+        super().__init__(status_code=409, message=message)
+
+class ValidationError(BaseError):
+    """
+    Exception raised when validation fails.
+    """
+    def __init__(self, message: str):
+        super().__init__(status_code=422, message=message)
+
+class ExternalAPIError(BaseError):
+    """
+    Exception raised when an external API call fails.
+    """
+    def __init__(self, message: str):
+        super().__init__(status_code=502, message=message)
+
+class NotAvailableError(BaseError):
+    """
+    Exception raised when a requested resource is not available.
+    """
+    def __init__(self, message: str):
+        super().__init__(status_code=503, message=message)
+
+class SubmodelNotSharedWithBusinessPartnerError(BaseError):
+    """
+    Exception raised when a requested twin is not shared with the specified business partner.
+    """
+    def __init__(self, message: str):
+        super().__init__(status_code=403, message=message)
+
+class DppNotFoundError(Exception):
+    """Exception raised when a DPP is not found."""
+
+    def __init__(self, message: str, dpp_id: str):
+        self.message = message
+        self.dpp_id = dpp_id
+        super().__init__(self.message)
+
+
+class DppShareError(Exception):
+    """Exception raised when DPP sharing fails."""
+
+    def __init__(self, message: str, dpp_id: str, partner: str):
+        self.message = message
+        self.dpp_id = dpp_id
+        self.partner = partner
+        super().__init__(self.message)
+
+class NotificationCreationError(BaseError):
+    """
+    Exception raised when notification creation fails.
+    """
+    def __init__(self, message: str = "Failed to create notification."):
+        super().__init__(status_code=502, message=message)
+
+class NotificationUpdateStatusError(BaseError):
+    """
+    Exception raised when updating notification status fails.
+    """
+    def __init__(self, message: str = "Failed to update notification status."):
+        super().__init__(status_code=502, message=message)
+
+class NotificationRetrievalError(BaseError):
+    """
+    Exception raised when retrieving notifications fails.
+    """
+    def __init__(self, message: str = "Failed to retrieve notifications."):
+        super().__init__(status_code=502, message=message)
+
+class NotificationDeleteError(BaseError):
+    """
+    Exception raised when deleting a notification fails.
+    """
+    def __init__(self, message: str = "Failed to delete notification."):
+        super().__init__(status_code=502, message=message)
+
+class NotificationSendingError(BaseError):
+    """
+    Exception raised when sending a notification fails.
+
+    The optional ``details`` list can carry context useful for diagnosing the
+    failure — e.g. which DSP URL was attempted and the underlying error
+    message — so that API consumers can act on the information without having
+    to grep server logs.
+    """
+    def __init__(self, message: str = "Failed to send notification.", details: Optional[list[str]] = None):
+        super().__init__(status_code=502, message=message, details=details)
+
+
+class PolicyMismatchError(BaseError):
+    """
+    Exception raised when no allowed policy matches the catalog's available policies.
+
+    Carries per-policy diff details captured from the SDK's DEBUG-level diagnostic
+    log messages (``tractusx_sdk.dataspace.tools.dsp_tools``) so the frontend can
+    display them in a human-readable dropdown without requiring the operator to dig
+    through server logs.
+
+    Example details entry::
+
+        "Allowed policy [0] differences:\n"
+        "  - permission.constraint.and[2]: constraint mismatch\n"
+        "  Catalog:  'UsagePurpose' 'isAnyOf' 'cx.core.digitalTwinRegistry:1'\n"
+        "  Allowed:  'UsagePurpose' 'isAnyOf' 'cx.core.digitalTwinRegistry:2'"
+    """
+
+    def __init__(self, message: str, details: Optional[list[str]] = None) -> None:
+        super().__init__(status_code=403, message=message, details=details)

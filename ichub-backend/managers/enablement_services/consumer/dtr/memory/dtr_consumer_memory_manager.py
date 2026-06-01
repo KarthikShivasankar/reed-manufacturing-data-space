@@ -1,0 +1,2061 @@
+#################################################################################
+# Eclipse Tractus-X - Industry Core Hub Backend
+#
+# Copyright (c) 2026 LKS Next
+# Copyright (c) 2025 Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License, Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied. See the
+# License for the specific language govern in permissions and limitations
+# under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+#################################################################################
+
+## This file was created using an LLM (Claude Sonnet 4) and reviewed by a human committer
+
+import copy
+import hashlib
+import logging
+import threading
+import time
+import json
+import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import TYPE_CHECKING, Dict, List, Optional, Union, Any
+from tractusx_sdk.dataspace.tools import op
+from sqlmodel import Session
+from tractusx_sdk.dataspace.services.connector import BaseConnectorConsumerService
+from managers.enablement_services.consumer.base_dtr_consumer_manager import BaseDtrConsumerManager
+from managers.enablement_services.consumer.dtr.pagination_manager import PaginationManager, DtrPaginationState, PageState
+if TYPE_CHECKING:
+    from managers.enablement_services.connector_manager import BaseConnectorConsumerManager
+from tractusx_sdk.dataspace.tools import HttpTools
+
+class DtrConsumerMemoryManager(BaseDtrConsumerManager):
+    """
+    Memory-based implementation of DTR consumer management.
+    
+    This class provides in-memory caching of DTR information with
+    time-based expiration for Business Partner Numbers (BPNs). Extends
+    the base DTR consumer manager interface.
+    """ 
+    
+    ## Declare variables
+    known_dtrs: Dict
+    logger: logging.Logger
+    verbose: bool
+
+    def __init__(self, connector_consumer_manager: 'BaseConnectorConsumerManager', expiration_time: int = 60, logger:logging.Logger=None, verbose:bool=False, dct_type_id="dct:type", dct_type_key:str="'http://purl.org/dc/terms/type'.'@id'", operator:str="=", dct_type:str="https://w3id.org/catenax/taxonomy#DigitalTwinRegistry"):
+        """
+        Initialize the memory-based DTR consumer manager.
+        
+        Args:
+            connector_consumer_manager (BaseConnectorConsumerManager): Connector manager with consumer capabilities
+            expiration_time (int, optional): Cache expiration time in minutes. Defaults to 60.
+        """
+        super().__init__(connector_consumer_manager, expiration_time, dct_type_id=dct_type_id, dct_type_key=dct_type_key, operator=operator, dct_type=dct_type)
+        self.known_dtrs = {}
+        self.shell_descriptors = {}  # Central storage for shell descriptors by shell ID
+        self.logger = logger if logger else None
+        self.verbose = verbose
+        # Use separate locks for different data structures to reduce contention
+        self._dtrs_lock = threading.RLock()  # Only for known_dtrs modifications
+        self._shells_lock = threading.RLock()  # Only for shell_descriptors modifications
+        self._list_lock = threading.RLock()  # Only for thread-safe list operations
+        
+    def add_dtr(self, bpn: str, connector_url: str, asset_id: str, policies: List[str]) -> None:
+        """
+        Add DTR to the in-memory cache for a specific BPN.
+        
+        Supports multiple DTRs per BPN using asset_id as unique key.
+        
+        Args:
+            bpn (str): The Business Partner Number to associate DTR with
+            connector_url (str): URL of the EDC where the DTR is stored
+            asset_id (str): Asset ID of the DTR (used as unique key)
+            policies (List[str]): List of policies for this DTR
+        """
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Trying to acquire lock (add_dtr)")
+        with self._dtrs_lock:
+            self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Acquired lock (add_dtr)")
+            if bpn not in self.known_dtrs:
+                self.known_dtrs[bpn] = {}
+
+            # Always update the refresh interval timestamp
+            self.known_dtrs[bpn][self.REFRESH_INTERVAL_KEY] = op.get_future_timestamp(minutes=self.expiration_time)
+            
+            # Initialize DTR dictionary if it doesn't exist
+            if self.DTR_DATA_KEY not in self.known_dtrs[bpn]:
+                self.known_dtrs[bpn][self.DTR_DATA_KEY] = {}
+            
+            # Check if this specific DTR already exists (avoid duplicates)
+            if asset_id in self.known_dtrs[bpn][self.DTR_DATA_KEY]:
+                if(self.logger and self.verbose):
+                    self.logger.debug(f"[DTR Manager] [{bpn}] DTR with asset ID [{asset_id}] already cached, skipping duplicate")
+                return
+            
+            # Add the new DTR using asset_id as key
+            self.known_dtrs[bpn][self.DTR_DATA_KEY][asset_id] = self._create_dtr_cache_entry(connector_url=connector_url, asset_id=asset_id, policies=policies)
+
+            if(self.logger and self.verbose):
+                total_dtrs = len(self.known_dtrs[bpn][self.DTR_DATA_KEY])
+                self.logger.info(f"[DTR Manager] [{bpn}] Added DTR to the cache! Asset ID: [{asset_id}] (Total DTRs: {total_dtrs}) Next refresh at [{op.timestamp_to_datetime(self.known_dtrs[bpn][self.REFRESH_INTERVAL_KEY])}] UTC")
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Released lock (add_dtr)")    
+        
+        return
+
+    def _create_dtr_cache_entry(self, connector_url: str, asset_id: str, policies: List[Union[str, Dict[str, Any]]]) -> dict:
+        """
+        Create a new DTR cache entry for a specific BPN.
+        
+        Args:
+            bpn (str): The Business Partner Number to associate DTR with
+            connector_url (str): URL of the EDC where the DTR is stored
+            asset_id (str): Asset ID of the DTR
+            policies (List[Union[str, Dict[str, Any]]]): List of policies for this DTR (cleaned of @id and @type)
+        """
+
+        return {
+                    self.DTR_CONNECTOR_URL_KEY: connector_url,
+                    self.DTR_ASSET_ID_KEY: asset_id,
+                    self.DTR_POLICIES_KEY: policies
+                }
+
+    def is_dtr_known(self, bpn: str, asset_id: str) -> bool:
+        """
+        Check if a specific DTR is known/cached for the given BPN.
+        
+        Args:
+            bpn (str): The Business Partner Number to check
+            asset_id (str): The asset ID to verify
+            
+        Returns:
+            bool: True if the DTR is known for the BPN, False otherwise
+        """
+        # Read operation - no lock needed for simple lookups
+        if bpn not in self.known_dtrs:
+            return False
+        
+        if self.DTR_DATA_KEY not in self.known_dtrs[bpn]:
+            return False
+            
+        dtr_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+        if not isinstance(dtr_dict, dict):
+            return False
+            
+        return asset_id in dtr_dict
+
+    def get_dtr_by_asset_id(self, bpn: str, asset_id: str) -> Optional[Dict]:
+        """
+        Retrieve a specific DTR by its asset ID for the given BPN.
+        
+        Args:
+            bpn (str): The Business Partner Number
+            asset_id (str): The asset ID of the DTR
+            
+        Returns:
+            Optional[Dict]: The DTR data if found, None otherwise
+        """
+        # Read operation - no lock needed for simple lookups
+        if bpn not in self.known_dtrs:
+            return None
+        
+        if self.DTR_DATA_KEY not in self.known_dtrs[bpn]:
+            return None
+            
+        dtr_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+        if not isinstance(dtr_dict, dict):
+            return None
+            
+        if asset_id in dtr_dict:
+            return copy.deepcopy(dtr_dict[asset_id])
+        
+        return None
+
+    def get_known_dtrs(self) -> Dict:
+        """
+        Retrieve all known DTRs from the cache.
+        
+        Returns:
+            Dict: Complete cache dictionary containing all BPNs and their associated DTRs
+        """
+        # Read operation - return a deep copy of the current state
+        return copy.deepcopy(self.known_dtrs)
+
+    def delete_dtr(self, bpn: str, asset_id: str) -> Dict:
+        """
+        Remove a specific DTR from the cache.
+        
+        Args:
+            bpn (str): The Business Partner Number
+            asset_id (str): The asset ID of the DTR to remove
+            
+        Returns:
+            Dict: Updated cache state after deletion
+        """
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Trying to acquire lock (delete_dtr)")
+        with self._dtrs_lock:
+            self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Acquired lock (delete_dtr)")
+            if bpn in self.known_dtrs and self.DTR_DATA_KEY in self.known_dtrs[bpn]:
+                dtr_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+                if isinstance(dtr_dict, dict) and asset_id in dtr_dict:
+                    del dtr_dict[asset_id]
+                    if(self.logger and self.verbose):
+                        remaining_dtrs = len(dtr_dict)
+                        self.logger.info(f"[DTR Manager] [{bpn}] Deleted DTR with asset ID [{asset_id}] from cache (Remaining DTRs: {remaining_dtrs})")
+            
+            return self.get_known_dtrs()
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Released lock (delete_dtr)")
+
+    def purge_bpn(self, bpn: str) -> None:
+        """
+        Remove all DTRs associated with a specific BPN from the cache.
+        
+        Args:
+            bpn (str): The Business Partner Number to purge from cache
+        """
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Trying to acquire lock (purge_bpn)")
+        with self._dtrs_lock:
+            self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Acquired lock (purge_bpn)")
+            if bpn in self.known_dtrs:
+                del self.known_dtrs[bpn]
+                if(self.logger and self.verbose):
+                    self.logger.info(f"[DTR Manager] [{bpn}] Purged all DTRs from cache")
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Released lock (purge_bpn)")
+
+    def purge_cache(self) -> None:
+        """
+        Clear the entire DTR cache and shell descriptors.
+        
+        This method removes all cached DTRs for all BPNs and all shell descriptors,
+        effectively resetting the cache to an empty state.
+        """
+        # Need both locks since we're clearing everything
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Trying to acquire locks (purge_cache)")
+        with self._dtrs_lock:
+            self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Acquired locks (purge_cache)")
+            self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Trying to acquire lock (purge_cache - shells)")
+            with self._shells_lock:
+                self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Acquired lock (purge_cache - shells)")
+                self.known_dtrs.clear()
+                self.shell_descriptors.clear()
+                if(self.logger and self.verbose):
+                    self.logger.info("[DTR Manager] Purged entire DTR cache and shell descriptors")
+            self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Released lock (purge_cache - shells)")        
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Released locks (purge_cache)")
+
+    def get_dtrs_by_connector(self, bpn: str, connector_url: str) -> List[Dict]:
+        """
+        Retrieve DTRs for a specific BPN from a specific connector.
+        
+        Args:
+            bpn (str): The Business Partner Number
+            connector_url (str): The connector URL to filter by
+            
+        Returns:
+            List[Dict]: List of DTR data from the specified connector
+        """
+        # Read operation - no lock needed for lookups
+        if bpn not in self.known_dtrs or self.DTR_DATA_KEY not in self.known_dtrs[bpn]:
+            return []
+            
+        dtr_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+        if not isinstance(dtr_dict, dict):
+            return []
+            
+        # Filter DTRs by connector URL
+        filtered_dtrs = [
+            copy.deepcopy(dtr) for dtr in dtr_dict.values()
+            if dtr.get(self.DTR_CONNECTOR_URL_KEY) == connector_url
+        ]
+        
+        return filtered_dtrs
+
+    def get_dtr_count(self, bpn: str) -> int:
+        """
+        Get the total number of DTRs cached for a specific BPN.
+        
+        Args:
+            bpn (str): The Business Partner Number
+            
+        Returns:
+            int: Number of DTRs cached for the BPN
+        """
+        # Read operation - no lock needed
+        if bpn not in self.known_dtrs or self.DTR_DATA_KEY not in self.known_dtrs[bpn]:
+            return 0
+            
+        dtr_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+        if isinstance(dtr_dict, dict):
+            return len(dtr_dict)
+        
+        return 0
+
+    def get_all_connector_urls(self, bpn: str) -> List[str]:
+        """
+        Get all unique connector URLs that have DTRs for a specific BPN.
+        
+        Args:
+            bpn (str): The Business Partner Number
+            
+        Returns:
+            List[str]: List of unique connector URLs
+        """
+        # Read operation - no lock needed
+        if bpn not in self.known_dtrs or self.DTR_DATA_KEY not in self.known_dtrs[bpn]:
+            return []
+            
+        dtr_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+        if not isinstance(dtr_dict, dict):
+            return []
+            
+        # Extract unique connector URLs
+        connector_urls = set()
+        for dtr in dtr_dict.values():
+            connector_url = dtr.get(self.DTR_CONNECTOR_URL_KEY)
+            if connector_url:
+                connector_urls.add(connector_url)
+        
+        return list(connector_urls)
+
+    def get_all_asset_ids(self, bpn: str) -> List[str]:
+        """
+        Get all asset IDs for DTRs cached for a specific BPN.
+        
+        Args:
+            bpn (str): The Business Partner Number
+            
+        Returns:
+            List[str]: List of asset IDs
+        """
+        # Read operation - no lock needed
+        if bpn not in self.known_dtrs or self.DTR_DATA_KEY not in self.known_dtrs[bpn]:
+            return []
+            
+        dtr_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+        if isinstance(dtr_dict, dict):
+            return list(dtr_dict.keys())
+        
+        return []
+
+    def get_dtrs(self, bpn: str, timeout:int=30) -> List[Dict]:
+        """
+        Retrieve DTRs for a specific BPN, with automatic discovery if not cached.
+        
+        This method first checks the cache for existing DTRs. If cache is empty
+        or expired, it uses the connector manager to get connectors for the BPN,
+        then queries each connector's catalog to find DTR assets.
+        
+        Args:
+            bpn (str): The Business Partner Number to get DTRs for
+            timeout (int): Timeout for catalog requests
+            
+        Returns:
+            List[Dict]: List of DTR data for the BPN, each containing connector_url, asset_id, and policies
+        """
+        # Check if we have cached data that hasn't expired (read operation - no lock needed)
+        if bpn in self.known_dtrs and not self._is_cache_expired(bpn):
+            if self.DTR_DATA_KEY in self.known_dtrs[bpn] and isinstance(self.known_dtrs[bpn][self.DTR_DATA_KEY], dict):
+                cached_dtrs_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+                if len(cached_dtrs_dict) > 0:
+                    if(self.logger and self.verbose):
+                        self.logger.debug(f"[DTR Manager] [{bpn}] Returning {len(cached_dtrs_dict)} DTRs from cache. Next refresh at [{op.timestamp_to_datetime(self.known_dtrs[bpn][self.REFRESH_INTERVAL_KEY])}] UTC")
+                    # Return list of DTR values
+                    return [copy.deepcopy(dtr) for dtr in cached_dtrs_dict.values()]
+        
+        
+        # Cache is expired or doesn't exist, discover DTRs
+        if(self.logger and self.verbose):
+            self.logger.info(f"[DTR Manager] No cached DTRs were found, discovering DTRs for bpn [{bpn}]...")
+            
+        # Get connectors from the connector manager
+        try:
+            connectors = self.connector_consumer_manager.get_connectors(bpn)
+            if not connectors or len(connectors) == 0:
+                if(self.logger and self.verbose):
+                    self.logger.warning(f"[DTR Manager] [{bpn}] No connectors found for DTR discovery")
+                return []
+            
+            if(self.logger and self.verbose):
+                self.logger.debug(f"[DTR Manager] [{bpn}] Found {len(connectors)} connectors, searching for DTR assets")
+            
+            # Search for DTR assets in each connector's catalog
+            connector_service:BaseConnectorConsumerService = self.connector_consumer_manager.connector_service
+            
+            # Delegate parallel catalog fetching to the SDK service, which
+            # automatically builds the correct version-aware CatalogModel
+            # (Jupiter: protocol="dataspace-protocol-http",
+            #  Saturn: protocol="dataspace-protocol-http:2025-1").
+            # Use _with_bpnl variant so Jupiter uses BPNL directly as counterPartyId
+            # while Saturn resolves the DID from the BPNL via Connector Discovery Service.
+            catalogs: dict = connector_service.get_catalogs_by_dct_type_with_bpnl(
+                                    bpnl=bpn,
+                                    edcs=connectors,
+                                    dct_type=self.dct_type,
+                                    dct_type_key=self.dct_type_key,
+                                    timeout=timeout
+                                    )
+        
+            # Iterate over catalogs and extract DTR information
+            for connector_url, catalog in catalogs.items():
+                if catalog and not catalog.get("error"):
+                    # Get datasets from the catalog — supports both Jupiter
+                    # ("dcat:dataset") and Saturn ("dataset") key formats.
+                    datasets = self._get_catalog_datasets(catalog)
+                    
+                    for dataset in datasets:
+                        if self._is_dtr_asset(dataset):
+                            # Extract asset ID
+                            asset_id = dataset.get(self.ID_KEY, "")
+                            if not asset_id:
+                                continue
+                            
+                            # Extract policies
+                            policies = self._extract_policies(dataset)
+                            
+                            # Create DTR data structure
+                            self.add_dtr(bpn=bpn, connector_url=connector_url, asset_id=asset_id, policies=policies)
+
+                            if(self.logger and self.verbose):
+                                self.logger.info(f"[DTR Manager] [{bpn}] Found DTR asset [{asset_id}] in connector [{connector_url}] added to cache")
+            
+            # Return the cached DTRs for this BPN
+            if bpn in self.known_dtrs and self.DTR_DATA_KEY in self.known_dtrs[bpn]:
+                cached_dtrs_dict = self.known_dtrs[bpn][self.DTR_DATA_KEY]
+                if isinstance(cached_dtrs_dict, dict):
+                    cached_dtrs_list = list(cached_dtrs_dict.values())
+                    if(self.logger and self.verbose):
+                        self.logger.info(f"[DTR Manager] [{bpn}] Discovery complete. Found {len(cached_dtrs_list)} DTR(s) total")
+                    return [copy.deepcopy(dtr) for dtr in cached_dtrs_list]
+                else:
+                    return []
+            else:
+                if(self.logger and self.verbose):
+                    self.logger.info(f"[DTR Manager] [{bpn}] No DTR assets found in any connector catalogs")
+                return []
+    
+        except Exception as e:
+            if(self.logger and self.verbose):
+                self.logger.error(f"[DTR Manager] [{bpn}] Error discovering DTRs: {e}")
+            return []
+
+    def discover_shells(self, counter_party_id: str, query_spec: List[Dict[str, str]], dtr_policies: Optional[List[Dict]] = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> Dict:
+        """
+        Discover digital twin shells using query specifications with DTR tracking and pagination.
+        
+        Args:
+            counter_party_id (str): The Business Partner Number
+            query_spec (List[Dict[str, str]]): Query specifications for shell discovery
+            dtr_policies (Optional[List[Dict]]): DTR policies to use for connection negotiation. 
+                                               If None, will use policies from cached DTR entries for automatic contract negotiation.
+            limit (Optional[int]): Maximum number of shells to return
+            cursor (Optional[str]): Pagination cursor for continuing previous queries
+        """
+        dtrs = self.get_dtrs(counter_party_id)
+        if not dtrs:
+            return {"shell_descriptors": [], "dtrs": [], "error": "No DTRs found"}
+        
+        # Remove the validation for dtr_policies since we now support automatic negotiation
+        # if not dtr_policies:
+        #     return {"shell_descriptors": [], "dtrs": [], "error": "No DTR policies provided"}
+        
+        # Decode cursor or initialize
+        if cursor:
+            current_page = PaginationManager.decode_page_token(cursor)
+            
+            # Check if cursor is compatible with current limit
+            if not PaginationManager.is_cursor_compatible(current_page, limit):
+                # Cursor is incompatible - start fresh but use DTR cursors as starting point
+                # This allows continuing from where we left off but with new limit
+                return {
+                    "shellDescriptors": [],
+                    "dtrs": [],
+                    "error": f"Cursor was created with limit {current_page.limit} but request has limit {limit}. Please start pagination from the beginning."+ "\n" +"LIMIT_MISMATCH"
+                }
+        else:
+            # Initialize first page
+            current_page = PageState(dtr_states={}, page_number=0, limit=limit)
+        
+        all_shells = []
+        dtr_results = []
+        connector_service = self.connector_consumer_manager.connector_service
+        
+        # Calculate per-DTR limit
+        active_dtrs = len([dtr for dtr in dtrs if not current_page.dtr_states.get(dtr.get(self.DTR_ASSET_ID_KEY), DtrPaginationState("")).exhausted])
+        per_dtr_limit = PaginationManager.distribute_limit(limit or 50, active_dtrs) if limit else None
+        
+        # Process DTRs
+        new_dtr_states = {}
+        for dtr in dtrs:
+            asset_id = dtr.get(self.DTR_ASSET_ID_KEY)
+            dtr_state = current_page.dtr_states.get(asset_id, DtrPaginationState(asset_id))
+            
+            if dtr_state.exhausted:
+                new_dtr_states[asset_id] = dtr_state
+                continue
+            
+            dtr = self._process_dtr_with_retry(
+                connector_service, counter_party_id, dtr, query_spec, dtr_policies,
+                limit=per_dtr_limit, cursor=dtr_state.cursor
+            )
+            
+            dtr_results.append(dtr)
+            shells = dtr.get("shells", [])
+            all_shells.extend(shells)
+            
+            # Update DTR state
+            paging_metadata = dtr.get("paging_metadata", {})
+            new_cursor = paging_metadata.get("cursor")
+            new_dtr_states[asset_id] = DtrPaginationState(
+                asset_id=asset_id,
+                cursor=new_cursor,
+                exhausted=not new_cursor
+            )
+            
+            # Stop if we've reached the total limit
+            if limit and len(all_shells) >= limit:
+                all_shells = all_shells[:limit]
+                break
+        
+        # Create new page state with reference to current page as previous
+        new_page = PageState(
+            dtr_states=new_dtr_states,
+            page_number=current_page.page_number + 1,
+            limit=limit,  # Store the limit used for this page
+            previous_state=current_page  # Store current page as previous state
+        )
+        
+        # Get shell descriptors
+        shell_descriptors = [self.shell_descriptors.get(shell_id) for shell_id in all_shells if shell_id in self.shell_descriptors]
+        
+        # Generate pagination tokens - only include pagination if limit or cursor was provided
+        pagination_enabled = limit is not None or cursor is not None
+        
+        response = {
+            "shellDescriptors": shell_descriptors,
+            "dtrs": dtr_results,
+            "shellsFound": len(shell_descriptors)
+        }
+        
+        if pagination_enabled:
+            # Generate next cursor if there's more data
+            has_more = PaginationManager.has_more_data(new_dtr_states)
+            next_cursor = PaginationManager.encode_page_token(new_page) if has_more else None
+            
+            # Generate previous cursor if we have a previous state
+            previous_cursor = None
+            if current_page.previous_state is not None:
+                previous_cursor = PaginationManager.encode_page_token(current_page.previous_state)
+            elif current_page.page_number > 0:
+                # For cases where we don't have previous_state but page_number > 0
+                # This shouldn't happen with proper implementation, but as a fallback
+                # we create an empty previous state
+                empty_previous = PageState(
+                    dtr_states={}, 
+                    page_number=current_page.page_number - 1,
+                    limit=limit
+                )
+                previous_cursor = PaginationManager.encode_page_token(empty_previous)
+            
+            pagination = {
+                "page": new_page.page_number
+            }
+            if next_cursor:
+                pagination["next"] = next_cursor
+            if previous_cursor:
+                pagination["previous"] = previous_cursor
+                
+            response["pagination"] = pagination
+        
+        return response
+
+    def _process_dtr_parallel(self, connector_service, counter_party_id: str, dtr: Dict, query_spec: List[Dict], dtr_policies: Optional[List[Dict]] = None, dtr_results: List = None, limit: Optional[int] = None, cursor: Optional[str] = None) -> None:
+        """Process a single DTR in parallel and append result to shared list."""
+        dtr = self._process_dtr_with_retry(connector_service, counter_party_id, dtr, query_spec, dtr_policies, limit=limit, cursor=cursor)
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Trying to acquire lock (_process_dtr_parallel)")
+        with self._list_lock:  # Thread-safe append to shared list
+            self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Acquired lock (_process_dtr_parallel)")
+            dtr_results.append(dtr)
+        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Released lock (_process_dtr_parallel)")
+
+    def _process_dtr_with_retry(self, connector_service, counter_party_id: str, dtr: Dict, query_spec: List[Dict], dtr_policies: Optional[List[Dict]] = None, max_retries: int = 2, limit: Optional[int] = None, cursor: Optional[str] = None) -> Dict:
+        """Process a single DTR with retry mechanism."""
+        connector_url = dtr.get(self.DTR_CONNECTOR_URL_KEY)
+        asset_id = dtr.get(self.DTR_ASSET_ID_KEY)
+        
+        # Use provided policies or fall back to cached policies for automatic negotiation
+        policies_to_use = dtr_policies if dtr_policies else dtr.get(self.DTR_POLICIES_KEY, [])
+        
+        dtr = {
+            "connectorUrl": connector_url,
+            "assetId": asset_id,
+            "status": "failed",
+            "shellsFound": 0,
+            "shells": []
+        }
+        
+        if not policies_to_use:
+            dtr["error"] = "No DTR policies provided and no cached policies available"
+            return dtr
+        
+        filter_expression = connector_service.get_filter_expression(
+            key=self.dct_type_key, operator=self.operator, value=self.dct_type
+        )
+        
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                self.logger.info(f"[DTR Manager] [{counter_party_id}] Retrying DTR [{asset_id}] at [{connector_url}] (attempt {attempt + 1}/{max_retries + 1})...")
+            try:
+                # Establish connection
+                dataplane_url, access_token = connector_service.do_dsp_with_bpnl(
+                    bpnl=counter_party_id,
+                    counter_party_address=connector_url,
+                    policies=policies_to_use,
+                    filter_expression=filter_expression
+                )
+                
+                # Search for shells
+                url = f"{dataplane_url}/lookup/shellsByAssetLink"
+                if limit is not None or cursor is not None:
+                    query_params = []
+                    if limit is not None:
+                        query_params.append(f"limit={limit}")
+                    if cursor is not None:
+                        query_params.append(f"cursor={cursor}")
+                    url += "?" + "&".join(query_params)
+                
+                response = HttpTools.do_post(
+                    url=url,
+                    headers={"Authorization": f"{access_token}"},
+                    json=query_spec
+                )
+                
+                if response.status_code == 200:
+                    response_data = response.json()
+                    shell_ids = self._extract_shell_ids(response_data)
+                    shells = self._fetch_shell_descriptors(response_data, dataplane_url, access_token)
+                    
+                    # Store shell descriptors in central memory
+                    for shell in shells:
+                        shell_id = shell.get("id")
+                        if shell_id:
+                            self.shell_descriptors[shell_id] = shell
+                    
+                    dtr.update({
+                        "status": "connected",
+                        "shellsFound": len(shell_ids),
+                        "shells": shell_ids,  # Store just IDs in DTR info
+                        "paging_metadata": response_data.get("paging_metadata", {})
+                    })
+                    return dtr
+                else:
+                    # Delete failed connection for retry
+                    self._delete_connection(connector_service, counter_party_id, connector_url, policies_to_use, filter_expression, counter_party_id, asset_id)
+
+                    if attempt == max_retries:
+                        dtr["error"] = f"HTTP {response.status_code} after {max_retries + 1} attempts"
+                    else:
+                        self.logger.warning(f"[DTR Manager] [{counter_party_id}] DTR [{asset_id}] returned HTTP {response.status_code}, will retry ({attempt + 1}/{max_retries + 1})...")
+
+            except Exception as e:
+                # Delete failed connection for retry
+                self._delete_connection(connector_service, counter_party_id, connector_url, policies_to_use, filter_expression, counter_party_id, asset_id)
+
+                if attempt == max_retries:
+                    dtr["error"] = str(e)
+                else:
+                    self.logger.warning(f"[DTR Manager] [{counter_party_id}] DTR [{asset_id}] attempt {attempt + 1}/{max_retries + 1} failed with exception: {e}, will retry...")
+        
+        return dtr
+    
+    def _fetch_shell_descriptor(self, shell_uuid: str, dataplane_url: str, access_token: str) -> Dict:
+        """Fetch single shell descriptor by UUID."""
+        encoded_uuid = base64.b64encode(shell_uuid.encode('utf-8')).decode('utf-8')
+        response = HttpTools.do_get(
+            url=f"{dataplane_url}/shell-descriptors/{encoded_uuid}",
+            headers={"Authorization": f"{access_token}"}
+        )
+        if response.status_code == 200:
+            return response.json()
+        return None
+    
+    def _fetch_submodel_descriptor(self, shell_id: str, submodel_id: str, dataplane_url: str, access_token: str) -> Optional[Dict]:
+        """Fetch single submodel descriptor by shell ID and submodel ID.
+        
+        Args:
+            shell_id: The shell ID
+            submodel_id: The submodel ID
+            dataplane_url: The dataplane URL for API calls
+            access_token: The access token for authentication
+            
+        Returns:
+            Optional[Dict]: The submodel descriptor if found, None otherwise
+        """
+        encoded_shell_id = base64.b64encode(shell_id.encode('utf-8')).decode('utf-8')
+        encoded_submodel_id = base64.b64encode(submodel_id.encode('utf-8')).decode('utf-8')
+        
+        response = HttpTools.do_get(
+            url=f"{dataplane_url}/shell-descriptors/{encoded_shell_id}/submodel-descriptors/{encoded_submodel_id}",
+            headers={"Authorization": f"{access_token}"}
+        )
+        
+        if response.status_code == 200:
+            return response.json()
+        return None
+    
+    def _process_submodel_descriptor(self, submodel_descriptor: Dict, submodel_id: str, governance: Optional[List[Dict]], connector_url: str, asset_id: str, counter_party_id: str = None) -> Dict:
+        """Process a submodel descriptor and create response structure.
+        
+        Args:
+            submodel_descriptor: The submodel descriptor data
+            submodel_id: The submodel ID
+            governance: Optional governance policies
+            connector_url: The connector URL
+            asset_id: The asset ID
+            counter_party_id: Optional counter party ID for submodel data fetching
+            
+        Returns:
+            Dict: Response with submodel descriptor, data, and DTR info
+        """
+        # Extract information from submodel descriptor
+        current_semantic_id = self._extract_semantic_id(submodel_descriptor)
+        asset_id_sub, connector_url_sub, href = self._extract_submodel_endpoint_info(submodel_descriptor)
+        semantic_ids_base64 = self._create_semantic_ids_base64(submodel_descriptor)
+        
+        # Determine status and prepare descriptor
+        descriptor = {
+            "submodelId": submodel_id,
+            "semanticId": current_semantic_id,
+            "semanticIdKeys": semantic_ids_base64,
+            "assetId": asset_id_sub,
+            "connectorUrl": connector_url_sub,
+            "href": href,
+            "status": self._determine_single_submodel_status(current_semantic_id, governance)
+        }
+        
+        # Add error message if needed
+        if descriptor["status"] == "error" and not current_semantic_id:
+            descriptor["error"] = "No semantic ID found in submodel descriptor"
+        
+        response = {
+            "submodelDescriptor": descriptor,
+            "submodel": {},
+            "dtr": {
+                "connectorUrl": connector_url,
+                "assetId": asset_id,
+            }
+        }
+        
+        # Fetch submodel data if governance policies are available and counter_party_id is provided
+        if counter_party_id and governance and descriptor["status"] == "pending":
+            submodel_info = {
+                "submodel_id": submodel_id,
+                "semantic_id": current_semantic_id,
+                "policies": governance,
+                "assetId": asset_id_sub,
+                "connectorUrl": connector_url_sub,
+                "href": href
+            }
+            response = self._fetch_single_submodel_data(counter_party_id, submodel_info, response)
+        
+        return response
+    
+    def _fetch_shell_descriptors(self, shells_response: Dict, dataplane_url: str, access_token: str) -> List[Dict]:
+        """Fetch shell descriptors from shell UUIDs in parallel."""
+        shell_uuids = shells_response.get('result', []) if isinstance(shells_response, dict) else shells_response
+        if not shell_uuids:
+            return []
+        
+        shells = []
+        threads = []
+        
+        # Use a thread-safe list to collect results
+        def fetch_single_shell(shell_uuid: str, results_list: List[Dict]):
+            try:
+                shell = self._fetch_shell_descriptor(shell_uuid, dataplane_url, access_token)
+                if shell:
+                    self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Trying to acquire lock (fetch_single_shell)")
+                    with self._list_lock:  # Thread-safe append
+                        self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Acquired lock (fetch_single_shell)")
+                        results_list.append(shell)
+                    self.logger.debug(f"[DTR Manager] [{threading.get_ident()}] Released lock (fetch_single_shell)")
+            except Exception:
+                # Silently continue on error
+                pass
+        
+        # Start threads for parallel fetching
+        for shell_uuid in shell_uuids:
+            thread = threading.Thread(target=fetch_single_shell, args=(shell_uuid, shells))
+            thread.start()
+            threads.append(thread)
+        
+        # Wait for all threads to complete
+        for thread in threads:
+            thread.join()
+        
+        return shells
+        
+    def _extract_shell_ids(self, shells_response: Dict) -> List[str]:
+        """Extract shell IDs from the lookup response."""
+        if isinstance(shells_response, dict) and 'result' in shells_response:
+            return shells_response.get('result', [])
+        elif isinstance(shells_response, list):
+            return shells_response
+        return []
+
+    def _delete_connection(self, connector_service:BaseConnectorConsumerService, counter_party_id: str, connector_url: str, policies: List, filter_expression: Dict, bpn: str, asset_id: str):
+        """Delete a failed EDR connection so the next retry negotiates a fresh one.
+        
+        Only the connection/EDR is removed — the DTR cache entry is intentionally
+        kept because the DTR itself was validly discovered in the catalog. A
+        transient dataplane error (e.g. HTTP 500) does not mean the DTR is invalid.
+        
+        Both the in-memory SDK cache and the persistent edr_connections DB table
+        are cleaned up so that a stale EDR is not reloaded after a restart.
+        """
+        policies_checksum = hashlib.sha3_256(str(policies).encode('utf-8')).hexdigest()
+        filter_checksum = hashlib.sha3_256(str(filter_expression).encode('utf-8')).hexdigest()
+
+        # 1. Remove from SDK in-memory cache
+        connector_service.connection_manager.delete_connection(
+            counter_party_id=counter_party_id,
+            counter_party_address=connector_url,
+            query_checksum=filter_checksum,
+            policy_checksum=policies_checksum
+        )
+
+        # 2. Remove from the persistent edr_connections DB table so the stale
+        #    EDR is not reloaded on the next startup or request.
+        self._purge_edr_from_db(counter_party_id, asset_id)
+
+    def discover_shell(self, counter_party_id: str, id: str, dtr_policies: Optional[List[Dict]] = None) -> Dict:
+        """
+        Discover a single digital twin shell by ID with DTR tracking and retry.
+        
+        Args:
+            counter_party_id (str): The Business Partner Number
+            id (str): The shell ID to discover
+            dtr_policies (Optional[List[Dict]]): DTR policies to use for connection negotiation.
+                                               If None, will use policies from cached DTR entries for automatic contract negotiation.
+        """
+        dtrs = self.get_dtrs(counter_party_id)
+        if not dtrs:
+            return {"status": 404, "error": "No DTRs found for this counterPartyId"}
+
+        if not id:
+            return {"status": 400, "error": "No shell ID provided"}
+        
+        connector_service = self.connector_consumer_manager.connector_service
+        
+        # Try each DTR to find the shell
+        for dtr in dtrs:
+            connector_url = dtr.get(self.DTR_CONNECTOR_URL_KEY)
+            asset_id = dtr.get(self.DTR_ASSET_ID_KEY)
+            
+            # Use provided policies or fall back to cached policies for automatic negotiation
+            policies_to_use = dtr_policies if dtr_policies else dtr.get(self.DTR_POLICIES_KEY, [])
+            
+            filter_expression = connector_service.get_filter_expression(
+                key=self.dct_type_key, operator=self.operator, value=self.dct_type
+            )
+            
+            try:
+                # Establish connection
+                dataplane_url, access_token = connector_service.do_dsp_with_bpnl(
+                    bpnl=counter_party_id,
+                    counter_party_address=connector_url,
+                    policies=policies_to_use,
+                    filter_expression=filter_expression
+                )
+                
+                # Fetch specific shell descriptor
+                shell = self._fetch_shell_descriptor(id, dataplane_url, access_token)
+                if shell:
+                    return {
+                        "shell_descriptor": shell,
+                        "dtr": {
+                            "connectorUrl": connector_url,
+                            "assetId": asset_id,
+                        }
+                    }
+                    
+            except Exception as e:
+                if self.logger and self.verbose:
+                    self.logger.debug(f"[DTR Manager] [{counter_party_id}] Failed to fetch shell {id} from DTR {connector_url}: {e}")
+                continue
+
+        return {"status": 404, "error": "Shell not found in any DTR of this counterPartyId"}
+
+    def discover_submodels(self, counter_party_id: str, id: str, dtr_policies: Optional[List[Dict]] = None, governance: Optional[Dict[str, List[Dict]]] = None) -> Dict:
+        """
+        Retrieve submodel data by first discovering the shell and then fetching all submodels in parallel.
+        
+        Args:
+            counter_party_id: The Business Partner Number
+            id: The shell ID to discover
+            dtr_policies: Optional DTR policies to use for connection negotiation.
+                        If None, will use policies from cached DTR entries for automatic contract negotiation.
+            governance: Optional mapping of semantic IDs to their policies. If None, only submodel 
+                       descriptors are returned without actual data (status will be "governance_not_found")
+            
+        Returns:
+            Dict: Response with submodel descriptors, data, DTR info, and count of submodels found
+                - submodelDescriptors: Dict mapping submodel IDs to their descriptors with status
+                - submodels: Dict mapping submodel IDs to their actual data (if successfully fetched)
+                - submodelsFound: Int count of total submodels discovered in the shell
+                - dtr: DTR connection information
+        """
+        # Discover the shell
+        shell_result = self.discover_shell(counter_party_id, id, dtr_policies)
+        if "shell_descriptor" not in shell_result:
+            return {
+                "status": "error",
+                "error": shell_result.get("error", "Failed to discover shell"),
+                "submodelDescriptors": {},
+                "submodels": {},
+                "submodelsFound": 0,
+                "dtr": None
+            }
+            
+        shell_descriptor = shell_result["shell_descriptor"]
+        dtr_info = shell_result.get("dtr", {})
+        submodel_descriptors = shell_descriptor.get("submodelDescriptors", [])
+        
+        response = {
+            "submodelDescriptors": {},
+            "submodels": {},
+            "dtr": dtr_info
+        }
+        
+        if not submodel_descriptors:
+            response["error"] = "No submodels found in shell"
+            response["submodelsFound"] = 0
+            return response
+            
+        # Process submodels and collect metadata
+        submodels_to_fetch = []
+        for submodel in submodel_descriptors:
+            submodel_id = submodel.get("id", "unknown")
+            semantic_id = self._extract_semantic_id(submodel)
+            asset_id, connector_url, href = self._extract_submodel_endpoint_info(submodel)
+            semantic_ids_base64 = self._create_semantic_ids_base64(submodel)
+            
+            # Determine status and prepare descriptor
+            descriptor = {
+                "submodelId": submodel_id,
+                "semanticId": semantic_id,
+                "semanticIdKeys": semantic_ids_base64,
+                "assetId": asset_id,
+                "connectorUrl": connector_url,
+                "href": href,
+                "status": self._determine_submodel_status(semantic_id, governance)
+            }
+            
+            # Add error message if needed
+            if descriptor["status"] == "error" and not semantic_id:
+                descriptor["error"] = "No semantic ID found in submodel descriptor"
+            
+            response["submodelDescriptors"][submodel_id] = descriptor
+            
+            # Queue for data fetching if needed (only if governance is provided)
+            if governance and descriptor["status"] == "pending":
+                submodels_to_fetch.append({
+                    "submodel_id": submodel_id,
+                    "semantic_id": semantic_id,
+                    "policies": governance[semantic_id],
+                    "assetId": asset_id,
+                    "connectorUrl": connector_url,
+                    "href": href
+                })
+        
+        # Fetch submodel data in parallel (only if governance policies are available)
+        if submodels_to_fetch:
+            self._fetch_submodels_data(counter_party_id, submodels_to_fetch, response)
+        
+        # Add count of submodels found
+        response["submodelsFound"] = len(submodel_descriptors)
+        
+        return response
+
+    def discover_submodel(self, counter_party_id: str, id: str, dtr_policies: Optional[List[Dict]] = None, governance: Optional[List[Dict]] = None, submodel_id: str = None, max_retries: int = 1) -> Dict:
+        """
+        Retrieve a specific submodel data by submodel ID using direct API call for faster, exact lookup.
+        
+        Args:
+            counter_party_id: The Business Partner Number
+            id: The shell ID to discover
+            dtr_policies: Optional DTR policies to use for connection negotiation.
+                        If None, will use policies from cached DTR entries for automatic contract negotiation.
+            governance: Optional list of policies for the submodel. If None, only submodel 
+                       descriptor is returned without actual data (status will be "governance_not_found")
+            submodel_id: The specific submodel ID to search for (required)
+            max_retries: Maximum number of connection retry attempts (default: 1)
+            
+        Returns:
+            Dict: Response with submodel descriptor, data, and DTR info
+                - submodelDescriptor: Dict containing the submodel descriptor with status
+                - submodel: Dict containing the actual submodel data (if successfully fetched)
+                - dtr: DTR connection information
+        """
+        # Get DTRs for the counter party
+        dtrs = self.get_dtrs(counter_party_id)
+        if not dtrs:
+            return {
+                "status": "error",
+                "error": "No DTRs found for this counterPartyId",
+                "submodelDescriptor": {},
+                "submodel": {},
+                "dtr": None
+            }
+        else:
+            self.logger.debug(f"[DTR Manager] [{counter_party_id}] Found {len(dtrs)} DTR(s) for submodel discovery")
+            self.logger.debug(f"[DTR Manager] [{counter_party_id}] DTRs: {dtrs}")
+
+        connector_service: BaseConnectorConsumerService = self.connector_consumer_manager.connector_service
+
+        # Try each DTR to find the submodel
+        for dtr in dtrs:
+            connector_url = dtr.get(self.DTR_CONNECTOR_URL_KEY)
+            asset_id = dtr.get(self.DTR_ASSET_ID_KEY)
+            
+            # Use provided policies or fall back to cached policies for automatic negotiation
+            policies_to_use = dtr_policies if dtr_policies else dtr.get(self.DTR_POLICIES_KEY, [])
+            
+            filter_expression = connector_service.get_filter_expression(
+                key=self.dct_type_key, operator=self.operator, value=self.dct_type
+            )
+            
+            try:
+                # Establish connection
+                dataplane_url, access_token = connector_service.do_dsp_with_bpnl(
+                    bpnl=counter_party_id,
+                    counter_party_address=connector_url,
+                    policies=policies_to_use,
+                    filter_expression=filter_expression
+                )
+                self.logger.debug(f"[DTR Manager] [{counter_party_id}] Connected to DTR at {connector_url} for submodel discovery")
+                self.logger.debug(f"[DTR Manager] [{counter_party_id}] Using policies: {policies_to_use}")
+                self.logger.debug(f"[DTR Manager] [{counter_party_id}] Dataplane URL: {dataplane_url}")
+
+                # Direct API call to fetch specific submodel descriptor
+                submodel_descriptor = self._fetch_submodel_descriptor(id, submodel_id, dataplane_url, access_token)
+                self.logger.debug(f"[DTR Manager] [{counter_party_id}] Fetched submodel descriptor for submodel ID {submodel_id} from DTR at {connector_url}: {submodel_descriptor}")
+                
+                if submodel_descriptor is not None:
+                    return self._process_submodel_descriptor(
+                        submodel_descriptor, submodel_id, governance, 
+                        connector_url, asset_id, counter_party_id
+                    )
+                
+                return {
+                    "status": "error",
+                    "error": "Failed to fetch submodel descriptor data due to DTR not accessible or submodel not found",
+                    "submodelDescriptor": {},
+                    "submodel": {},
+                    "dtr": None
+                }
+                    
+            except Exception as e:
+                if self.logger and self.verbose:
+                    self.logger.debug(f"[DTR Manager] [{counter_party_id}] Failed to fetch submodel {submodel_id} from DTR {connector_url}: {e}")
+                continue
+        
+        return {
+            "status": "error",
+            "error": f"Submodel '{submodel_id}' not found in any DTR of this counterPartyId",
+            "submodelDescriptor": {},
+            "submodel": {},
+            "dtr": None
+        }
+
+    def discover_submodel_by_semantic_ids(self, counter_party_id: str, id: str, dtr_policies: Optional[List[Dict]] = None, governance: Optional[List[Dict]] = None, semantic_ids: List[Dict[str, str]] = None) -> Dict:
+        """
+        Retrieve submodel data by semantic IDs. May return multiple results.
+        
+        Searches for submodels by semantic IDs (requiring all to match).
+        
+        Args:
+            counter_party_id: The Business Partner Number
+            id: The shell ID to discover
+            dtr_policies: Optional DTR policies to use for connection negotiation.
+                        If None, will use policies from cached DTR entries for automatic contract negotiation.
+            governance: Optional list of policies for the submodel. If None, only submodel 
+                       descriptor is returned without actual data (status will be "governance_not_found")
+            semantic_ids: List of semantic ID objects to search for.
+                         Each object should have "type" and "value" keys.
+                         ALL semantic IDs must match for the submodel to be selected.
+                         Example: [{"type": "GlobalReference", "value": "urn:samm:..."}]
+            
+        Returns:
+            Dict: Response with submodel descriptors, data, and DTR info
+                - submodelDescriptors: Dict mapping submodel IDs to their descriptors with status
+                - submodels: Dict mapping submodel IDs to their actual data (if successfully fetched)
+                - submodelsFound: Int count of total submodels matching the semantic IDs
+                - dtr: DTR connection information
+        """
+        # Discover the shell
+        shell_result = self.discover_shell(counter_party_id, id, dtr_policies)
+        if "shell_descriptor" not in shell_result:
+            return {
+                "status": "error",
+                "error": shell_result.get("error", "Failed to discover shell"),
+                "submodelDescriptors": {},
+                "submodels": {},
+                "submodelsFound": 0,
+                "dtr": None
+            }
+            
+        shell_descriptor = shell_result["shell_descriptor"]
+        dtr_info = shell_result.get("dtr", {})
+        submodel_descriptors = shell_descriptor.get("submodelDescriptors", [])
+        
+        response = {
+            "submodelDescriptors": {},
+            "submodels": {},
+            "submodelsFound": 0,
+            "dtr": dtr_info
+        }
+        
+        if not submodel_descriptors:
+            response["error"] = "No submodels found in shell"
+            return response
+            
+        # Process submodels and filter by semantic_ids (all must match)
+        submodels_to_fetch = []
+        found_submodels = []
+        
+        for submodel in submodel_descriptors:
+            current_submodel_id = submodel.get("id", "unknown")
+            current_semantic_id = self._extract_semantic_id(submodel)
+            current_all_semantic_ids = self._extract_all_semantic_ids(submodel)
+            
+            # Check semantic_ids (all must match)
+            if semantic_ids and self._semantic_ids_match(current_all_semantic_ids, semantic_ids):
+                # Found a matching submodel
+                found_submodels.append(submodel)
+                asset_id, connector_url, href = self._extract_submodel_endpoint_info(submodel)
+                semantic_ids_base64 = self._create_semantic_ids_base64(submodel)
+                
+                # Determine status and prepare descriptor
+                descriptor = {
+                    "submodelId": current_submodel_id,
+                    "semanticId": current_semantic_id,
+                    "semanticIdKeys": semantic_ids_base64,
+                    "assetId": asset_id,
+                    "connectorUrl": connector_url,
+                    "href": href,
+                    "status": self._determine_single_submodel_status(current_semantic_id, governance)
+                }
+                
+                # Add error message if needed
+                if descriptor["status"] == "error" and not current_semantic_id:
+                    descriptor["error"] = "No semantic ID found in submodel descriptor"
+                
+                response["submodelDescriptors"][current_submodel_id] = descriptor
+                
+                # Queue for data fetching if needed (only if governance is provided)
+                if governance and descriptor["status"] == "pending":
+                    submodels_to_fetch.append({
+                        "submodel_id": current_submodel_id,
+                        "semantic_id": current_semantic_id,
+                        "policies": governance,  # governance is a list for single submodel
+                        "assetId": asset_id,
+                        "connectorUrl": connector_url,
+                        "href": href
+                    })
+        
+        # Set count of found submodels
+        response["submodelsFound"] = len(found_submodels)
+        
+        # Check if any submodels were found
+        if not found_submodels:
+            semantic_criteria = []
+            for sem_id in semantic_ids:
+                semantic_criteria.append(f"{sem_id['type']}:{sem_id['value']}")
+            search_criteria = f"semantic_ids [{', '.join(semantic_criteria)}]"
+            response["error"] = f"No submodels found with {search_criteria} in shell"
+            return response
+        
+        # Fetch submodel data for multiple submodels (only if governance policies are available)
+        if submodels_to_fetch:
+            self._fetch_submodels_data(counter_party_id, submodels_to_fetch, response)
+        
+        return response
+    
+    def _determine_submodel_status(self, semantic_id: Optional[str], governance: Optional[Dict[str, List[Dict]]]) -> str:
+        """Determine the status of a submodel based on its semantic ID and governance policies (batch case)."""
+        if not semantic_id:
+            return "error"
+        elif not governance or semantic_id not in governance:
+            return "governance_not_found"
+        else:
+            return "pending"
+    
+    def _determine_single_submodel_status(self, semantic_id: Optional[str], governance: Optional[List[Dict]]) -> str:
+        """Determine the status of a submodel based on its semantic ID and governance policies (single submodel case)."""
+        if not semantic_id:
+            return "error"
+        elif not governance:
+            return "governance_not_found"
+        else:
+            return "pending"
+    
+    def _fetch_submodels_data(self, counter_party_id: str, submodels_to_fetch: List[Dict], response: Dict) -> None:
+        """Fetch submodel data in parallel and update the response."""
+        # Group by asset_id for optimization
+        assets_to_negotiate = self._group_submodels_by_asset(submodels_to_fetch)
+        
+        # Negotiate assets in parallel
+        asset_tokens, asset_errors = self._negotiate_assets_parallel(counter_party_id, assets_to_negotiate)
+        
+        # Mark failed negotiations with specific error messages
+        self._mark_failed_negotiations(assets_to_negotiate, asset_tokens, asset_errors, response)
+        
+        # Fetch data in parallel
+        self._fetch_data_parallel(submodels_to_fetch, asset_tokens, response)
+        
+        # Mark any remaining pending items as failed
+        self._mark_remaining_pending_as_failed(submodels_to_fetch, response)
+    
+    def _fetch_single_submodel_data(self, counter_party_id: str, submodel_info: Dict, response: Dict) -> Dict:
+        """Fetch data for a single submodel and update the response."""
+        submodel_id = submodel_info["submodel_id"]
+        asset_id = submodel_info["assetId"]
+        connector_url = submodel_info["connectorUrl"]
+        href = submodel_info["href"]
+        policies = submodel_info["policies"]
+        
+        # Update response structure for single submodel
+        if asset_id == "unknown" or not asset_id:
+            response["submodelDescriptor"]["status"] = "error"
+            response["submodelDescriptor"]["error"] = "Invalid asset ID"
+            return response
+        
+        # --- Step 1: Contract negotiation (with one stale-EDR retry) ---
+        access_token = None
+        for _neg_attempt in range(2):  # attempt 0 = first try, attempt 1 = retry after purge
+            try:
+                access_token = self._negotiate_asset(counter_party_id, asset_id, connector_url, policies)
+                break  # success – exit the retry loop
+            except Exception as neg_exc:
+                if self.logger:
+                    self.logger.error(
+                        f"[DTR Manager] [{counter_party_id}] Contract negotiation exception for asset [{asset_id}] "
+                        f"(attempt {_neg_attempt + 1}/2): {neg_exc}"
+                    )
+
+                if _neg_attempt == 0:
+                    # First failure — the cached EDR may be stale.  Purge and retry.
+                    purge_ok = False
+                    try:
+                        purge_ok = self._purge_asset_cache(counter_party_id, asset_id, connector_url, policies)
+                    except Exception as purge_exc:
+                        if self.logger:
+                            self.logger.debug(
+                                f"[DTR Manager] [{counter_party_id}] Purge after failed negotiation raised: {purge_exc}"
+                            )
+                    if purge_ok:
+                        if self.logger:
+                            self.logger.info(
+                                f"[DTR Manager] [{counter_party_id}] Stale EDR purged for asset [{asset_id}]. "
+                                f"Waiting 5 s before retry negotiation..."
+                            )
+                        time.sleep(5)
+                        continue  # retry negotiation
+                    else:
+                        # Nothing was cached – not a stale-EDR problem; fail immediately.
+                        response["submodelDescriptor"]["status"] = "error"
+                        response["submodelDescriptor"]["error"] = (
+                            f"Contract negotiation failed for asset [{asset_id}]. "
+                            f"Access was denied — verify that the governance policies configured for this semantic ID "
+                            f"match the policies offered by the data provider. Detail: {neg_exc}"
+                        )
+                        return response
+                else:
+                    # Second failure – give up.
+                    response["submodelDescriptor"]["status"] = "error"
+                    response["submodelDescriptor"]["error"] = (
+                        f"Contract negotiation failed on retry for asset [{asset_id}] after purging the stale EDR. "
+                        f"The provider's connector may be temporarily unavailable. Detail: {neg_exc}"
+                    )
+                    return response
+
+        if not access_token:
+            response["submodelDescriptor"]["status"] = "error"
+            response["submodelDescriptor"]["error"] = (
+                f"Contract negotiation failed for asset [{asset_id}]. "
+                f"No access token was returned — verify that the governance policies configured for this semantic ID "
+                f"match the policies offered by the data provider."
+            )
+            return response
+
+        # --- Step 2: Data fetch (first attempt) ---
+        fetch_error = None
+        try:
+            data = self._fetch_submodel_data_with_token(submodel_id, href, access_token)
+            if data:
+                response["submodel"] = data
+                response["submodelDescriptor"]["status"] = "success"
+                return response
+        except RuntimeError as fetch_exc:
+            fetch_error = str(fetch_exc)
+            if self.logger:
+                self.logger.warning(
+                    f"[DTR Manager] [{counter_party_id}] Data fetch failed for asset [{asset_id}] "
+                    f"(contract negotiation succeeded). Purging cache and retrying. Error: {fetch_error}"
+                )
+
+        # --- Step 3: Purge stale EDR and retry ---
+        try:
+            existed = self._purge_asset_cache(counter_party_id, asset_id, connector_url, policies)
+            if not existed:
+                response["submodelDescriptor"]["status"] = "error"
+                response["submodelDescriptor"]["error"] = (
+                    f"Contract negotiation succeeded for asset [{asset_id}], but the EDR token could not be "
+                    f"found in the cache for purging. The provider's connector or dataplane may not be reachable "
+                    f"or the asset registration may be incorrect."
+                    + (f" Original fetch error: {fetch_error}" if fetch_error else "")
+                )
+                return response
+        except Exception as purge_exc:
+            if self.logger:
+                self.logger.warning(
+                    f"[DTR Manager] [{counter_party_id}] Cache purge failed for asset [{asset_id}]: {purge_exc}"
+                )
+
+        if self.logger:
+            self.logger.info(
+                f"[DTR Manager] [{counter_party_id}] Purged cached EDR for asset [{asset_id}]. Waiting 5s before retry..."
+            )
+        time.sleep(5)
+
+        try:
+            access_token = self._negotiate_asset(counter_party_id, asset_id, connector_url, policies)
+        except Exception as neg_retry_exc:
+            response["submodelDescriptor"]["status"] = "error"
+            response["submodelDescriptor"]["error"] = (
+                f"Contract negotiation failed on retry for asset [{asset_id}]. "
+                f"Detail: {neg_retry_exc}"
+            )
+            return response
+
+        if not access_token:
+            response["submodelDescriptor"]["status"] = "error"
+            response["submodelDescriptor"]["error"] = (
+                f"Contract negotiation returned no token on retry for asset [{asset_id}]. "
+                f"The provider's connector may have revoked access or the policies no longer match."
+            )
+            return response
+
+        try:
+            data = self._fetch_submodel_data_with_token(submodel_id, href, access_token)
+            if data:
+                if self.logger:
+                    self.logger.info(
+                        f"[DTR Manager] [{counter_party_id}] Retry succeeded for asset [{asset_id}]"
+                    )
+                response["submodel"] = data
+                response["submodelDescriptor"]["status"] = "success"
+                return response
+            else:
+                response["submodelDescriptor"]["status"] = "error"
+                response["submodelDescriptor"]["error"] = (
+                    f"Contract negotiation succeeded for asset [{asset_id}], but the submodel endpoint "
+                    f"returned no data after retry. The provider may not have registered any data behind "
+                    f"this submodel descriptor href, or the href [{href}] may be incorrect."
+                )
+        except RuntimeError as fetch_retry_exc:
+            response["submodelDescriptor"]["status"] = "error"
+            response["submodelDescriptor"]["error"] = (
+                f"Contract negotiation succeeded for asset [{asset_id}], but the provider's dataplane "
+                f"returned an error after retry. The provider's administrator must verify the dataplane "
+                f"registration and backend service configuration for this asset. "
+                f"Detail: {fetch_retry_exc}"
+            )
+            if self.logger:
+                self.logger.error(
+                    f"[DTR Manager] [{counter_party_id}] Dataplane error on retry for asset [{asset_id}]: {fetch_retry_exc}"
+                )
+        return response    
+    
+    def _group_submodels_by_asset(self, submodels_to_fetch: List[Dict]) -> Dict[str, Dict]:
+        """Group submodels by asset_id for optimization."""
+        assets_to_negotiate = {}
+        for item in submodels_to_fetch:
+            asset_id = item["assetId"]
+            if asset_id and asset_id != "unknown":
+                if asset_id not in assets_to_negotiate:
+                    assets_to_negotiate[asset_id] = {
+                        "connectorUrl": item["connectorUrl"],
+                        "policies": item["policies"],
+                        "submodels": []
+                    }
+                assets_to_negotiate[asset_id]["submodels"].append(item)
+        return assets_to_negotiate
+    
+    def _negotiate_assets_parallel(self, counter_party_id: str, assets_to_negotiate: Dict[str, Dict]) -> tuple[Dict[str, str], Dict[str, str]]:
+        """Negotiate assets in parallel and return successful tokens and error messages."""
+        asset_tokens = {}
+        asset_errors = {}
+        if not assets_to_negotiate:
+            return asset_tokens, asset_errors
+            
+        with ThreadPoolExecutor(max_workers=min(len(assets_to_negotiate), 10)) as executor:
+            future_to_asset = {
+                executor.submit(
+                    self._negotiate_asset,
+                    counter_party_id,
+                    asset_id,
+                    asset_info["connectorUrl"],
+                    asset_info["policies"]
+                ): asset_id
+                for asset_id, asset_info in assets_to_negotiate.items()
+            }
+            
+            for future in as_completed(future_to_asset):
+                asset_id = future_to_asset[future]
+                try:
+                    token = future.result()
+                    if token:
+                        asset_tokens[asset_id] = token
+                    else:
+                        asset_errors[asset_id] = "Asset negotiation failed. You may not have enough access permissions to this submodel."
+                except Exception as e:
+                    error_message = str(e)
+                    # Concatenate the specific error with the generic message
+                    combined_message = f"Asset negotiation failed. You may not have enough access permissions to this submodel. {error_message}"
+                    asset_errors[asset_id] = combined_message
+                    if self.logger and self.verbose:
+                        self.logger.error(f"[DTR Manager] [{counter_party_id}] Error negotiating asset {asset_id}: {e}")
+        
+        return asset_tokens, asset_errors
+    
+    def _mark_failed_negotiations(self, assets_to_negotiate: Dict[str, Dict], asset_tokens: Dict[str, str], asset_errors: Dict[str, str], response: Dict) -> None:
+        """Mark submodels with failed asset negotiations and include specific error messages."""
+        failed_assets = set(assets_to_negotiate.keys()) - set(asset_tokens.keys())
+        for asset_id in failed_assets:
+            # Get the specific error message for this asset, or use a default
+            error_message = asset_errors.get(asset_id, "Asset negotiation failed. You may not have enough access permissions to this submodel.")
+            
+            for submodel_item in assets_to_negotiate[asset_id]["submodels"]:
+                submodel_id = submodel_item["submodel_id"]
+                response["submodelDescriptors"][submodel_id]["status"] = "error"
+                response["submodelDescriptors"][submodel_id]["error"] = error_message
+    
+    def _fetch_data_parallel(self, submodels_to_fetch: List[Dict], asset_tokens: Dict[str, str], response: Dict) -> None:
+        """Fetch submodel data in parallel."""
+        fetch_tasks = [
+            item for item in submodels_to_fetch 
+            if item["assetId"] in asset_tokens
+        ]
+        
+        if not fetch_tasks:
+            return
+
+        with ThreadPoolExecutor(max_workers=min(len(fetch_tasks), 20)) as executor:
+            future_to_submodel = {
+                executor.submit(
+                    self._fetch_submodel_data_with_token,
+                    item["submodel_id"],
+                    item["href"],
+                    asset_tokens[item["assetId"]]
+                ): item["submodel_id"]
+                for item in fetch_tasks
+            }
+            
+            for future in as_completed(future_to_submodel):
+                submodel_id = future_to_submodel[future]
+                try:
+                    data = future.result()
+                    if data:
+                        response["submodels"][submodel_id] = data
+                        response["submodelDescriptors"][submodel_id]["status"] = "success"
+                    else:
+                        response["submodelDescriptors"][submodel_id]["status"] = "error"
+                        response["submodelDescriptors"][submodel_id]["error"] = (
+                            "Contract negotiation succeeded but the submodel endpoint returned no data. "
+                            "The provider may not have registered data for this submodel descriptor href."
+                        )
+                except RuntimeError as e:
+                    response["submodelDescriptors"][submodel_id]["status"] = "error"
+                    response["submodelDescriptors"][submodel_id]["error"] = (
+                        f"Contract negotiation succeeded, but the provider's dataplane returned an error. "
+                        f"The provider's administrator must verify the dataplane registration and backend "
+                        f"service configuration for this asset. Detail: {e}"
+                    )
+                    if self.logger:
+                        self.logger.error(f"[DTR Manager] Dataplane error fetching submodel {submodel_id}: {e}")
+                except Exception as e:
+                    response["submodelDescriptors"][submodel_id]["status"] = "error"
+                    response["submodelDescriptors"][submodel_id]["error"] = (
+                        f"Unexpected error during submodel data fetch: {e}"
+                    )
+                    if self.logger and self.verbose:
+                        self.logger.error(f"[DTR Manager] Unexpected error fetching submodel {submodel_id}: {e}")
+    
+    def _mark_remaining_pending_as_failed(self, submodels_to_fetch: List[Dict], response: Dict) -> None:
+        """Mark any remaining pending submodels as failed."""
+        for item in submodels_to_fetch:
+            submodel_id = item["submodel_id"]
+            if response["submodelDescriptors"][submodel_id]["status"] == "pending":
+                response["submodelDescriptors"][submodel_id]["status"] = "error"
+                response["submodelDescriptors"][submodel_id]["error"] = "Processing was not completed"
+
+    def _extract_semantic_id(self, submodel_descriptor: Dict) -> Optional[str]:
+        """Extract semantic ID value from submodel descriptor."""
+        semantic_id = submodel_descriptor.get("semanticId", {})
+        if isinstance(semantic_id, dict):
+            keys = semantic_id.get("keys", [])
+            if keys and isinstance(keys, list) and len(keys) > 0:
+                first_key = keys[0]
+                if isinstance(first_key, dict):
+                    return first_key.get("value")
+        return None
+    
+    def _extract_semantic_id_with_type(self, submodel_descriptor: Dict) -> Optional[Dict[str, str]]:
+        """Extract semantic ID with both type and value from submodel descriptor."""
+        semantic_id = submodel_descriptor.get("semanticId", {})
+        if isinstance(semantic_id, dict):
+            keys = semantic_id.get("keys", [])
+            if keys and isinstance(keys, list) and len(keys) > 0:
+                first_key = keys[0]
+                if isinstance(first_key, dict):
+                    return {
+                        "type": first_key.get("type"),
+                        "value": first_key.get("value")
+                    }
+        return None
+    
+    def _extract_all_semantic_ids(self, submodel_descriptor: Dict) -> List[Dict[str, str]]:
+        """Extract all semantic IDs with both type and value from submodel descriptor."""
+        semantic_id = submodel_descriptor.get("semanticId", {})
+        semantic_ids = []
+        
+        if isinstance(semantic_id, dict):
+            keys = semantic_id.get("keys", [])
+            if keys and isinstance(keys, list):
+                for key in keys:
+                    if isinstance(key, dict) and key.get("type") and key.get("value"):
+                        semantic_ids.append({
+                            "type": key.get("type"),
+                            "value": key.get("value")
+                        })
+        return semantic_ids
+    
+    def _semantic_ids_match(self, submodel_semantic_ids: List[Dict[str, str]], target_semantic_ids: List[Dict[str, str]]) -> bool:
+        """Check if all target semantic IDs are present in the submodel semantic IDs."""
+        if not target_semantic_ids:
+            return False
+        
+        # Convert to sets of tuples for easier comparison
+        submodel_set = {(sid["type"], sid["value"]) for sid in submodel_semantic_ids}
+        target_set = {(sid["type"], sid["value"]) for sid in target_semantic_ids}
+        
+        # All target semantic IDs must be present in the submodel
+        return target_set.issubset(submodel_set)
+        
+    def _extract_submodel_endpoint_info(self, submodel: Dict) -> tuple:
+        """Extract asset_id, connector_url, and href from submodel descriptor."""
+        asset_id = "unknown"
+        connector_url = "unknown"
+        href = "unknown"
+        
+        try:
+            endpoints = submodel.get("endpoints", [])
+            for endpoint in endpoints:
+                interface = endpoint.get("interface", "")
+                if "SUBMODEL-3.0" in interface:
+                    # Extract href
+                    href = endpoint.get("protocolInformation", {}).get("href", "unknown")
+                    if href and isinstance(href, str):
+                        href = href.replace("urn:uuid:", "")
+                    
+                    # Extract asset_id and connector_url from subprotocolBody
+                    subprotocol_body = endpoint.get("protocolInformation", {}).get("subprotocolBody", "")
+                    if subprotocol_body:
+                        parsed_body = self._parse_subprotocol_body(subprotocol_body)
+                        if parsed_body:
+                            asset_id = parsed_body.get("id", "unknown")
+                            connector_url = parsed_body.get("dspEndpoint", "unknown")
+                    break
+                    
+        except Exception as e:
+            if self.logger and self.verbose:
+                self.logger.error(f"[DTR Manager] Error extracting endpoint info: {e}")
+                
+        return asset_id, connector_url, href
+
+    def _create_semantic_ids_base64(self, submodel: Dict) -> str:
+        """Create base64 encoded semantic IDs from submodel descriptor."""
+        try:
+            semantic_id_obj = submodel.get("semanticId", {})
+            if semantic_id_obj:
+                # Convert semantic ID object to JSON string then encode to base64
+                semantic_id_json = json.dumps(semantic_id_obj, sort_keys=True)
+                semantic_id_bytes = semantic_id_json.encode('utf-8')
+                return base64.b64encode(semantic_id_bytes).decode('utf-8')
+            return ""
+        except Exception as e:
+            if self.logger and self.verbose:
+                self.logger.error(f"[DTR Manager] Error creating base64 semantic IDs: {e}")
+            return ""
+
+    def _parse_subprotocol_body(self, subprotocol_body: str) -> Optional[Dict[str, str]]:
+        """Parse subprotocol body to extract asset ID and DSP endpoint."""
+        try:
+            parts = subprotocol_body.split(";")
+            result = {}
+            for part in parts:
+                if "=" in part:
+                    key, value = part.split("=", 1)
+                    result[key] = value
+            return result
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # EDR lifecycle helpers — single authoritative source for EDR cleanup
+    # ------------------------------------------------------------------
+
+    def _purge_edr_from_db(self, counter_party_id: str, asset_id: str) -> int:
+        """Delete stale EDR rows from the persistent edr_connections table.
+
+        This is the low-level, DB-only primitive.  It is intentionally private
+        so that callers go through ``purge_edr`` (the public API) unless they
+        already handle the in-memory side themselves (as ``_delete_connection``
+        and ``_purge_asset_cache`` do).
+
+        .. note::
+            The ``counter_party_id`` column stores the full DID of the provider
+            (e.g. ``did:web:...staticdata:did:BPNL00000003CRHK``), not the raw
+            BPNL.  The filter therefore uses a ``LIKE '%' || :cpid`` (ends-with)
+            expression so that callers can pass either the raw BPNL or the full
+            DID and the match will succeed in both cases.
+
+        Args:
+            counter_party_id: BPNL or full DID of the data provider.
+            asset_id: EDC asset ID whose EDR rows should be deleted.
+
+        Returns:
+            int: Number of rows deleted (0 if no DB engine available or not found).
+        """
+        manager = self.connector_consumer_manager.connector_service.connection_manager
+        if not hasattr(manager, "engine"):
+            return 0  # In-memory-only SDK — nothing persistent to clean up
+
+        try:
+            from sqlalchemy import text as sa_text
+            with Session(manager.engine) as db_session:
+                result = db_session.execute(
+                    sa_text(
+                        "DELETE FROM edr_connections "
+                        "WHERE counter_party_id LIKE '%' || :cpid "
+                        "AND edr_data->>'assetId' = :asset_id"
+                    ),
+                    {"cpid": counter_party_id, "asset_id": asset_id},
+                )
+                db_session.commit()
+                rowcount = result.rowcount
+                if self.logger:
+                    if rowcount > 0:
+                        self.logger.info(
+                            f"[DTR Manager] [{counter_party_id}] Removed {rowcount} stale EDR(s) "
+                            f"from DB for asset [{asset_id}]"
+                        )
+                    else:
+                        self.logger.debug(
+                            f"[DTR Manager] [{counter_party_id}] No stale EDR found in DB "
+                            f"for asset [{asset_id}] (already clean)"
+                        )
+                return rowcount
+        except Exception as db_exc:
+            if self.logger:
+                self.logger.warning(
+                    f"[DTR Manager] [{counter_party_id}] Could not remove stale EDR from DB "
+                    f"for asset [{asset_id}]: {db_exc}"
+                )
+            return 0
+
+    def purge_edr(self, counter_party_id: str, asset_id: str) -> int:
+        """Remove a stale or expired EDR from both in-memory caches and the DB.
+
+        This is the **public, reusable entry point** for EDR cleanup.  Use it
+        whenever you detect that an EDR token is no longer valid::
+
+            # From a service or controller:
+            dtr_manager.consumer.purge_edr(provider_bpnl, asset_id)
+
+            # From internal retry logic:
+            self.purge_edr(counter_party_id, asset_id)
+
+        It performs two steps in order:
+
+        1. **Memory eviction** — scans and removes matching entries from the
+           SDK's internal caches (``_edr_tracked``, ``_connection_cache``) by
+           ``assetId`` value without needing policy/filter checksums.
+        2. **DB deletion** — delegates to :meth:`_purge_edr_from_db` so the
+           stale row is not reloaded on the next startup or request.
+
+        Args:
+            counter_party_id: Business Partner Number of the data provider.
+            asset_id: EDC asset ID whose EDR should be evicted.
+
+        Returns:
+            int: Number of DB rows deleted (0 if not found or no DB backend).
+        """
+        if self.logger:
+            self.logger.info(
+                f"[DTR Manager] [{counter_party_id}] purge_edr called for asset [{asset_id}]"
+            )
+
+        # Step 1 — Evict from SDK in-memory caches (best-effort; no checksums needed)
+        manager = self.connector_consumer_manager.connector_service.connection_manager
+        for cache_attr in ("_edr_tracked", "_connection_cache"):
+            if not hasattr(manager, cache_attr):
+                continue
+            try:
+                cache = getattr(manager, cache_attr)
+                keys_to_remove = [
+                    k for k, v in cache.items()
+                    if isinstance(v, dict)
+                    and (v.get("edr_data") or v).get("assetId") == asset_id
+                ]
+                for key in keys_to_remove:
+                    del cache[key]
+                    if self.logger:
+                        self.logger.info(
+                            f"[DTR Manager] [{counter_party_id}] Evicted EDR from "
+                            f"{cache_attr} for asset [{asset_id}] (key: {key})"
+                        )
+            except Exception as mem_exc:
+                if self.logger:
+                    self.logger.warning(
+                        f"[DTR Manager] [{counter_party_id}] Could not evict from "
+                        f"{cache_attr} for asset [{asset_id}]: {mem_exc}"
+                    )
+
+        # Step 2 — Persist the deletion to the DB
+        return self._purge_edr_from_db(counter_party_id, asset_id)
+
+    def purge_edrs_matching(self, counter_party_id: str, asset_id_pattern: str) -> int:
+        """Remove all stale EDRs whose asset ID matches a SQL LIKE pattern.
+
+        This covers cases where multiple EDRs share a common prefix, such as
+        all DigitalTwinEventAPI EDRs for a provider::
+
+            # From a service before sending a notification:
+            dtr_manager.consumer.purge_edrs_matching(
+                provider_bpnl, "ichub:asset:digitaltwin-event:%"
+            )
+
+        Memory eviction is best-effort (scans by prefix); the DB deletion is
+        authoritative.
+
+        Args:
+            counter_party_id: BPN of the data provider.
+            asset_id_pattern: SQL LIKE pattern (``%`` and ``_`` wildcards).
+
+        Returns:
+            int: Number of DB rows deleted.
+        """
+        if self.logger:
+            self.logger.info(
+                f"[DTR Manager] [{counter_party_id}] purge_edrs_matching "
+                f"called for pattern [{asset_id_pattern}]"
+            )
+
+        # Best-effort in-memory eviction — match on prefix (strip trailing %)
+        prefix = asset_id_pattern.rstrip("%")
+        manager = self.connector_consumer_manager.connector_service.connection_manager
+        for cache_attr in ("_edr_tracked", "_connection_cache"):
+            if not hasattr(manager, cache_attr):
+                continue
+            try:
+                cache = getattr(manager, cache_attr)
+                keys_to_remove = [
+                    k for k, v in cache.items()
+                    if isinstance(v, dict)
+                    and (v.get("edr_data") or v).get("assetId", "").startswith(prefix)
+                ]
+                for key in keys_to_remove:
+                    del cache[key]
+                    if self.logger:
+                        self.logger.info(
+                            f"[DTR Manager] [{counter_party_id}] Evicted EDR from "
+                            f"{cache_attr} matching [{asset_id_pattern}] (key: {key})"
+                        )
+            except Exception as mem_exc:
+                if self.logger:
+                    self.logger.warning(
+                        f"[DTR Manager] [{counter_party_id}] Could not evict from "
+                        f"{cache_attr} matching [{asset_id_pattern}]: {mem_exc}"
+                    )
+
+        # Authoritative DB deletion using a LIKE pattern.
+        # counter_party_id column stores the full DID, so match with ends-with.
+        if not hasattr(manager, "engine"):
+            return 0
+        try:
+            from sqlalchemy import text as sa_text
+            with Session(manager.engine) as db_session:
+                result = db_session.execute(
+                    sa_text(
+                        "DELETE FROM edr_connections "
+                        "WHERE counter_party_id LIKE '%' || :cpid "
+                        "AND edr_data->>'assetId' LIKE :pattern"
+                    ),
+                    {"cpid": counter_party_id, "pattern": asset_id_pattern},
+                )
+                db_session.commit()
+                rowcount = result.rowcount
+                if self.logger:
+                    if rowcount > 0:
+                        self.logger.info(
+                            f"[DTR Manager] [{counter_party_id}] Removed {rowcount} stale EDR(s) "
+                            f"from DB matching pattern [{asset_id_pattern}]"
+                        )
+                    else:
+                        self.logger.debug(
+                            f"[DTR Manager] [{counter_party_id}] No stale EDRs found in DB "
+                            f"matching pattern [{asset_id_pattern}] (already clean)"
+                        )
+                return rowcount
+        except Exception as db_exc:
+            if self.logger:
+                self.logger.warning(
+                    f"[DTR Manager] [{counter_party_id}] Could not remove stale EDRs from DB "
+                    f"matching pattern [{asset_id_pattern}]: {db_exc}"
+                )
+            return 0
+
+    def _negotiate_asset(self, counter_party_id: str, asset_id: str, dsp_endpoint_url: str, policies: List[Dict]) -> Optional[str]:
+        """Negotiate access to a single asset and return the access token."""
+        connector_service: BaseConnectorConsumerService = self.connector_consumer_manager.connector_service
+        filter_expression = connector_service.get_filter_expression(
+            key="https://w3id.org/edc/v0.0.1/ns/id", value=asset_id
+        )
+        dataplane_url, access_token = connector_service.do_dsp_with_bpnl(
+            bpnl=counter_party_id,
+            counter_party_address=dsp_endpoint_url,
+            policies=policies,
+            filter_expression=filter_expression
+        )
+        return access_token
+
+    def _purge_asset_cache(self, counter_party_id: str, asset_id: str, dsp_endpoint_url: str, policies: List[Dict]) -> bool:
+        """Purge asset from memory cache and delete from database."""
+        if self.logger:
+            self.logger.info(f"[DTR Manager] [{counter_party_id}] PURGE: Starting purge for asset [{asset_id}]")
+        
+        connector_service: BaseConnectorConsumerService = self.connector_consumer_manager.connector_service
+        policies_checksum = hashlib.sha3_256(str(policies).encode('utf-8')).hexdigest()
+        filter_checksum = hashlib.sha3_256(str(connector_service.get_filter_expression(key="https://w3id.org/edc/v0.0.1/ns/id", value=asset_id)).encode('utf-8')).hexdigest()
+
+        # Try to delete from memory cache (may fail if checksums don't match)
+        deleted_from_memory = connector_service.connection_manager.delete_connection(
+            counter_party_id=counter_party_id,
+            counter_party_address=dsp_endpoint_url,
+            query_checksum=filter_checksum,
+            policy_checksum=policies_checksum
+        )
+        
+        if self.logger:
+            if deleted_from_memory:
+                self.logger.info(f"[DTR Manager] [{counter_party_id}] PURGE: Standard deletion from memory succeeded for asset [{asset_id}]")
+            else:
+                self.logger.info(f"[DTR Manager] [{counter_party_id}] PURGE: Standard deletion failed (checksum mismatch), trying force-removal for asset [{asset_id}]")
+        
+        # If memory deletion failed, try to force-remove from SDK's internal cache
+        if not deleted_from_memory:
+            try:
+                # Try to access the SDK's _edr_tracked dictionary
+                if hasattr(connector_service.connection_manager, '_edr_tracked'):
+                    edr_tracked = connector_service.connection_manager._edr_tracked
+                    keys_to_remove = []
+                    
+                    # Find keys matching the asset_id
+                    for key, edr_entry in edr_tracked.items():
+                        if isinstance(edr_entry, dict):
+                            edr_data = edr_entry.get('edr_data') or edr_entry
+                            if edr_data.get('assetId') == asset_id:
+                                keys_to_remove.append(key)
+                    
+                    # Remove matched keys
+                    for key in keys_to_remove:
+                        del edr_tracked[key]
+                        deleted_from_memory = True
+                        if self.logger:
+                            self.logger.info(
+                                f"[DTR Manager] [{counter_party_id}] PURGE: Force-removed EDR from SDK _edr_tracked for asset [{asset_id}], key: {key}"
+                            )
+                
+                # Also try _connection_cache if it exists
+                if hasattr(connector_service.connection_manager, '_connection_cache') and not deleted_from_memory:
+                    cache = connector_service.connection_manager._connection_cache
+                    keys_to_remove = []
+                    for key, value in cache.items():
+                        if isinstance(value, dict) and value.get('assetId') == asset_id:
+                            keys_to_remove.append(key)
+                    
+                    for key in keys_to_remove:
+                        del cache[key]
+                        deleted_from_memory = True
+                        if self.logger:
+                            self.logger.info(
+                                f"[DTR Manager] [{counter_party_id}] PURGE: Force-removed EDR from SDK _connection_cache for asset [{asset_id}]"
+                            )
+            except Exception as exc:
+                if self.logger:
+                    self.logger.warning(
+                        f"[DTR Manager] [{counter_party_id}] PURGE: Could not force-remove from memory cache: {exc}"
+                    )
+        
+        # Always attempt database deletion, even if memory deletion failed.
+        # Delegate to the shared helper so the logic lives in one place.
+        deleted_from_db = self._purge_edr_from_db(counter_party_id, asset_id) > 0
+
+        if self.logger:
+            action = "✓ Purged from DB" if deleted_from_db else "✗ Not found in DB"
+            self.logger.info(
+                f"[DTR Manager] [{counter_party_id}] PURGE: {action} "
+                f"(memory: {deleted_from_memory}) for asset [{asset_id}]"
+            )
+
+        # Return True if deleted from either location
+        return deleted_from_memory or deleted_from_db
+            
+    def _fetch_submodel_data_with_token(self, submodel_id: str, href: str, access_token: str) -> Optional[Dict]:
+        """Fetch submodel data using a pre-negotiated access token.
+        
+        Raises RuntimeError with HTTP status details when the dataplane returns a non-200 response,
+        so callers can distinguish dataplane configuration errors from empty responses.
+        """
+        try:
+            headers = {"Authorization": f"{access_token}"}
+            response = HttpTools.do_get(href, headers=headers)
+            
+            if response.status_code == 200:
+                return response.json()
+            else:
+                # Try to extract a meaningful body snippet for the error
+                try:
+                    body_preview = response.text[:300] if response.text else "(empty body)"
+                except Exception:
+                    body_preview = "(unreadable body)"
+                error_msg = (
+                    f"Dataplane returned HTTP {response.status_code} from [{href}]. "
+                    f"Response: {body_preview}"
+                )
+                if self.logger:
+                    self.logger.warning(
+                        f"[DTR Manager] Submodel [{submodel_id}] fetch failed — "
+                        f"HTTP {response.status_code} from [{href}]: {body_preview}"
+                    )
+                raise RuntimeError(error_msg)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            if self.logger and self.verbose:
+                self.logger.error(f"[DTR Manager] Error fetching submodel {submodel_id}: {e}")
+            raise RuntimeError(f"Network or connection error while fetching submodel [{submodel_id}] from [{href}]: {e}") from e
+
+    def _is_dtr_asset(self, dataset: Dict) -> bool:
+        """
+        Check if a dataset from a catalog is a DTR asset.
+        
+        Args:
+            dataset (Dict): Dataset from the catalog
+            
+        Returns:
+            bool: True if this is a DTR asset, False otherwise
+        """
+        # Look for DTR-specific properties in the dataset
+        # This can be customized based on your DTR asset identification logic
+        dct_type_property = dataset.get(self.dct_type_id, {})
+        
+        # Remove .'@id' from dct_type_key if it exists to get the base property name
+        dct_type_key_base = self.dct_type_key.replace(f".'{self.ID_KEY}'", "") if f".'{self.ID_KEY}'" in self.dct_type_key else self.dct_type_key
+        dct_type_expanded_property = dataset.get(dct_type_key_base, {})
+    
+        # Format 1: "dct:type": {"@id": "https://w3id.org/catenax/taxonomy#DigitalTwinRegistry"}
+        if isinstance(dct_type_property, dict):
+            type_id = dct_type_property.get(self.ID_KEY, "")
+            if type_id == self.dct_type:
+                return True
+        elif isinstance(dct_type_property, str):
+            if dct_type_property == self.dct_type:
+                return True
+            
+        # Format 2: "http://purl.org/dc/terms/type": {"@id": "https://w3id.org/catenax/taxonomy#DigitalTwinRegistry"}
+        if isinstance(dct_type_expanded_property, dict):
+            type_id = dct_type_expanded_property.get(self.ID_KEY, "")
+            if type_id == self.dct_type:
+                return True
+        elif isinstance(dct_type_expanded_property, str):
+            if dct_type_expanded_property == self.dct_type:
+                return True
+        
+        return False
+
+    def _extract_policies(self, dataset: Dict) -> List[Union[str, Dict[str, Any]]]:
+        """
+        Extract policies from a dataset, excluding @id and @type metadata.
+        
+        Args:
+            dataset (Dict): Dataset from the catalog
+            
+        Returns:
+            List[Union[str, Dict[str, Any]]]: List of clean policy identifiers without @id and @type
+        """
+        policies = []
+        
+        # Extract policies — supports both Jupiter ("odrl:hasPolicy") and
+        # Saturn ("hasPolicy") key formats via the base-class helper.
+        has_policy = self._get_dataset_policies(dataset)
+
+        # Clean policies by removing @id and @type metadata
+        for policy in has_policy:
+            if isinstance(policy, dict):
+                # Create a clean copy without @id and @type
+                clean_policy = {k: v for k, v in policy.items() if k not in ["@id", "@type"]}
+                if clean_policy:  # Only add if there's actual content after cleaning
+                    policies.append(clean_policy)
+            elif isinstance(policy, str):
+                # If it's already a string (policy ID), keep it as is
+                policies.append(policy)
+
+        return policies
+
+    def _is_cache_expired(self, bpn: str) -> bool:
+        """
+        Check if cache for a specific BPN has expired.
+        
+        Implements the cache expiration logic by checking if the BPN exists
+        in the cache and whether the refresh interval timestamp has been reached.
+        
+        Args:
+            bpn (str): The Business Partner Number to check
+            
+        Returns:
+            bool: True if cache is expired or doesn't exist, False otherwise
+        """
+        # If BPN is not in cache, consider it expired
+        if bpn not in self.known_dtrs:
+            return True
+        
+        # If no refresh interval is set, consider it expired
+        if self.REFRESH_INTERVAL_KEY not in self.known_dtrs[bpn]:
+            return True
+        
+        # Check if the refresh interval has been reached
+        return op.is_interval_reached(self.known_dtrs[bpn][self.REFRESH_INTERVAL_KEY])

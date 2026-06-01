@@ -1,0 +1,122 @@
+#################################################################################
+# Eclipse Tractus-X - Industry Core Hub Backend
+#
+# Copyright (c) 2026 Contributors to the Eclipse Foundation
+#
+# See the NOTICE file(s) distributed with this work for additional
+# information regarding copyright ownership.
+#
+# This program and the accompanying materials are made available under the
+# terms of the Apache License, Version 2.0 which is available at
+# https://www.apache.org/licenses/LICENSE-2.0.
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+# either express or implied. See the
+# License for the specific language govern in permissions and limitations
+# under the License.
+#
+# SPDX-License-Identifier: Apache-2.0
+#################################################################################
+#
+# REED Dataspace - Participant: REED-SUPPLIER (data provider)
+# This is the bulky-part supplier that publishes manufacturing data.
+#
+# Learning mode: authorization is DISABLED so you can exercise every REED
+# endpoint from curl/UI without a token. With auth off, the backend treats the
+# caller as a trusted "service principal" (== reed-admin), which is exactly the
+# trust model documented in docs/reed/README.md. Switch to the Keycloak path in
+# the tutorial when you want to exercise per-user identity.
+
+hostname: "http://localhost:9000"
+bpn: "BPNLREEDSUPP0001"
+
+authorization:
+  enabled: false
+  api_key:
+    key: "X-Api-Key"
+    value: "reed-supplier-key"
+  keycloak:
+    enabled: false
+    auth_url: "http://localhost:8080"
+    realm: "REED"
+    client_id: "reed-supplier-api"
+    client_secret: "reed-supplier-secret"
+    retry:
+      max_retries: 1
+      retry_delay: 2
+      background_retry_interval: 60
+
+# REED resolves its own policy catalogue at runtime; no Catena-X agreements needed.
+agreements: []
+
+database:
+  connection_string: "postgresql://reed:reed@localhost:5433/reed_supplier"
+  echo: false
+
+cors:
+  enabled: true
+  allow_origins:
+    - "http://localhost:5173"
+    - "http://localhost:5174"
+  allow_credentials: true
+  allow_methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"]
+  allow_headers: ["*"]
+
+# The connector / DTR blocks below are placeholders for the optional EDC + DTR
+# layer (see the tutorial "Going sovereign" section). REED's classification,
+# policy, authorization, access-request and audit features work without them.
+consumer:
+  discovery:
+    discovery_finder:
+      url: "http://localhost:8082/api/v1.0/administration/connectors/discovery/search"
+    connector_discovery:
+      key: "bpn"
+    oauth:
+      url: "http://localhost:8080/auth/"
+      realm: "REED"
+      client_id: "reed-supplier-api"
+      client_secret: "reed-supplier-secret"
+    digitalTwinRegistry:
+      dct_type_key: "dct:type"
+      dct_type_filter:
+        operandLeft: "'http://purl.org/dc/terms/type'.'@id'"
+        operator: "="
+        operandRight: "https://w3id.org/catenax/taxonomy#DigitalTwinRegistry"
+  connector:
+    dataspace:
+      version: "saturn"
+    controlplane:
+      hostname: "http://localhost:8083"
+      apiKeyHeader: "X-Api-Key"
+      apiKey: "reed-edc-key"
+      managementPath: "/management"
+      protocolPath: "/api/v1/dsp"
+      catalogPath: "/catalog"
+
+provider:
+  connector:
+    dataspace:
+      version: "saturn"
+    controlplane:
+      hostname: "http://localhost:8083"
+      apiKeyHeader: "X-Api-Key"
+      apiKey: "reed-edc-key"
+      managementPath: "/management"
+      protocolPath: "/api/v1/dsp"
+    dataplane:
+      hostname: "http://localhost:8084"
+      publicPath: "/api/public"
+  digitalTwinRegistry:
+    hostname: "http://localhost:8085"
+    apiPath: "/api/v3"
+    uri: ""
+    asset_config:
+      dct_type: "https://w3id.org/catenax/taxonomy#DigitalTwinRegistry"
+    lookup:
+      uri: ""
+  submodel_dispatcher:
+    mode: "filesystem"
+    path: "reed-supplier/data/submodels"
+    apiPath: "/submodel-dispatcher"
