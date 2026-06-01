@@ -20,6 +20,10 @@ a full **audit trail** — all without rebuilding a connector, registry, identit
 system, or policy engine. Those responsibilities stay with the proven Tractus-X
 stack (EDC, DTR, Keycloak); REED owns only the manufacturing use-case layer.
 
+> 📖 **New here? Read [`REED-GUIDE.md`](REED-GUIDE.md)** — one complete, ordered
+> guide covering concepts → architecture → step-by-step deployment → workflow →
+> operations.
+
 > This repository is a fork of Industry Core Hub with the REED layer added. The
 > original project README is preserved at
 > [`docs/industry-core-hub-readme.md`](docs/industry-core-hub-readme.md).
